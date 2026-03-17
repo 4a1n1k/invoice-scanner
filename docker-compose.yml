@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  invoice-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: invoice-scanner:latest
+    container_name: invoice-scanner
+    restart: unless-stopped
+
+    # ── Port mapping ─────────────────────────────────────────────────────────
+    # Host port 3005 → container port 3005.
+    # Change the LEFT side only if 3005 is taken on the host.
+    ports:
+      - "3005:3005"
+
+    # ── Persistent volumes ───────────────────────────────────────────────────
+    volumes:
+      # Uploaded invoice files
+      - invoice_storage:/app/storage
+      # SQLite database
+      - invoice_db:/app/prisma
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    environment:
+      NODE_ENV: production
+      PORT: "3005"
+
+      # Database — points at the volume mount
+      DATABASE_URL: "file:/app/prisma/dev.db"
+
+      # Auth — MUST be overridden via .env or docker secret in production
+      AUTH_SECRET: "${AUTH_SECRET}"
+
+      # ── AI services (on the SAME host, reachable via host.docker.internal) ─
+      # The models run on the host; we use host.docker.internal so the
+      # container can reach them without hardcoding the host IP.
+      OCR_API_URL: "${OCR_API_URL:-http://host.docker.internal:5050/ocr/file}"
+      LLM_API_URL: "${LLM_API_URL:-http://host.docker.internal:11434/api/generate}"
+      LLM_MODEL:   "${LLM_MODEL:-gemma3:4b}"
+      LLM_MAX_CHARS: "${LLM_MAX_CHARS:-4000}"
+      AI_TIMEOUT_MS: "${AI_TIMEOUT_MS:-55000}"
+
+      STORAGE_ROOT: "storage/expenses"
+
+    # ── Give container access to host network for AI models ──────────────────
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # ── Health check ─────────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3005/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    # ── Logging ──────────────────────────────────────────────────────────────
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes survive container restarts and rebuilds
+volumes:
+  invoice_storage:
+    name: invoice-scanner_storage
+  invoice_db:
+    name: invoice-scanner_db
