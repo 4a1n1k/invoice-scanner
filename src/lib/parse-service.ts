@@ -1,8 +1,6 @@
 /**
  * Invoice parsing service.
- *
- * Encapsulates the full OCR → LLM pipeline so route handlers stay thin.
- * All external URLs come from `lib/config.ts` — never hardcoded here.
+ * OCR → text cleaning → LLM pipeline.
  */
 
 import { AI_CONFIG } from "./config";
@@ -42,75 +40,73 @@ export async function extractTextViaOcr(file: File): Promise<string> {
   }
 }
 
+// ─── Text pre-processing ──────────────────────────────────────────────────────
+/**
+ * Cleans raw OCR/PDF text before sending to the LLM.
+ * Key normalizations:
+ * - Thousands separators: "1,769.94" → "1769.94"  (LLM sometimes reads "1" from "1,769")
+ * - Hebrew thousands: "1,769.94" with RTL artifacts
+ * - Normalize date separators so LLM sees consistent patterns
+ */
+export function preprocessOcrText(raw: string): string {
+  let text = raw;
+
+  // Remove thousands-separator commas inside numbers: 1,769.94 → 1769.94
+  // Pattern: digit, comma, exactly 3 digits (optionally followed by decimal)
+  text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
+
+  // Also handle: ₪1,769 or NIS 1,769
+  text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
+
+  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026 (easier for LLM)
+  text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
+
+  return text;
+}
+
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
 
-/**
- * Builds a rich, robust prompt for invoice parsing.
- *
- * Improvements over the previous version:
- * - Explicit instructions for mobile/photo invoice quality (blurry, angled)
- * - Hebrew-aware: instructs model to handle both Hebrew and English text
- * - Explicit amount extraction rules (look for סה"כ / סכום / total / grand total)
- * - Date extraction rules (DD/MM/YYYY, YYYY-MM-DD, Hebrew month names)
- * - Category matching: fuzzy match against the user's list, never invent new ones
- * - Fallback rules for each field if extraction fails
- * - Output format is strict JSON, no markdown, no extra text
- */
-export function buildParsePrompt(ocrText: string, categories: string[]): string {
+export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
+  // Clean text first
+  const ocrText = preprocessOcrText(rawOcrText);
   const truncated = ocrText.substring(0, AI_CONFIG.llmMaxChars);
   const catList = categories.map((c) => `"${c}"`).join(", ");
   const today = new Date().toISOString().split("T")[0];
 
-  return `You are an expert invoice data extraction assistant. Your task is to extract structured data from OCR text of an invoice or receipt. The text may come from a mobile phone photo and could contain OCR errors, mixed Hebrew and English, or partial text.
+  return `You are an expert invoice data extraction assistant. Extract structured data from the invoice text below. The text may be in Hebrew or English.
 
 EXTRACTION RULES:
 
-1. AMOUNT (number):
-   - Find the TOTAL amount paid. Look for: סה"כ, סכום לתשלום, לתשלום, סה"כ לשלם, Total, Grand Total, Amount Due, לתשלום סופי
-   - If multiple totals exist, pick the LARGEST final total (after tax/VAT)
-   - Strip currency symbols (₪, NIS, ILS, $) and return only the number
-   - If VAT (מע"מ) is listed separately, include it in the total
-   - Fallback: if no clear total, sum up all line items
-   - Return as a decimal number (e.g., 150.50)
+1. AMOUNT (number, NO commas, NO currency symbols):
+   - Find the TOTAL amount paid. Look for: סה"כ, סה"כ לתשלום, לתשלום, Total, Grand Total, Amount Due
+   - CRITICAL: Numbers may appear as "1769.94" or "1,769.94" — strip ALL commas, return only digits and decimal point
+   - Return as plain number: 1769.94 (NOT "1,769.94", NOT "₪1769")
+   - If VAT (מע"מ) is listed separately, the total already includes it
+   - If you see "1769.94" anywhere near סה"כ or Total, that IS the amount
 
-2. DATE (string YYYY-MM-DD):
-   - Find the invoice/receipt date. Look for: תאריך, Date, Invoice Date, Receipt Date
-   - Support formats: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD, D בחודש YYYY
-   - Hebrew months: ינואר=01, פברואר=02, מרץ=03, אפריל=04, מאי=05, יוני=06, יולי=07, אוגוסט=08, ספטמבר=09, אוקטובר=10, נובמבר=11, דצמבר=12
-   - Always output as YYYY-MM-DD
-   - Fallback: use today's date: ${today}
+2. DATE (YYYY-MM-DD):
+   - Look for: תאריך, Date, שולם ב
+   - Formats you may see: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
+   - Convert DD/MM/YYYY → YYYY-MM-DD (example: 26/02/2026 → 2026-02-26)
+   - Fallback: today = ${today}
 
-3. TYPE (string — must be one of the allowed categories):
-   Allowed categories: [${catList}]
-   - Analyze the invoice content and business name to determine the best matching category
-   - Examples of matching:
-     * Pharmacy (בית מרקחת), doctor (רופא), medical (רפואי), dental (שיניים), optician (אופטיקה) → pick the health/medical category
-     * Supermarket (סופרמרקט), restaurant (מסעדה), food (מזון), groceries → pick the food category
-     * Clothing store (חנות בגדים), shoes (נעליים), fashion → pick the clothing category
-     * After-school activity, music class, sports club, tuition (שכר לימוד), kindergarten (גן) → pick the classes/education category
-   - If no category fits well, pick the closest one from the allowed list
-   - NEVER invent a category not in the list
+3. TYPE — must be exactly one of: [${catList}]
+   - Match by content: electricity/חשמל/חברת חשמל → utility/בריאות/אחר
+   - Supermarket/מכולת → food category
+   - Never invent a new category
 
-4. DESCRIPTION (string):
-   - Write a short 3-6 word description in Hebrew describing what was purchased
-   - Be specific: "נעליים לילד", "ביקור רופא ילדים", "חוג כדורגל", "קניות מכולת"
-   - Use the business name and items purchased to create the description
-   - Keep it concise and meaningful
+4. DESCRIPTION (Hebrew, 3-6 words):
+   - Describe what was paid, e.g.: "חשבון חשמל פברואר", "קניות סופרמרקט", "נעליים לילד"
 
-OUTPUT FORMAT:
-Return ONLY a valid JSON object. No markdown, no explanation, no extra text.
-{
-  "amount": <number>,
-  "date": "<YYYY-MM-DD>",
-  "type": "<one of the allowed categories>",
-  "description": "<short Hebrew description>"
-}
+OUTPUT — return ONLY this JSON, no other text:
+{"amount": <number>, "date": "<YYYY-MM-DD>", "type": "<category>", "description": "<hebrew description>"}
 
 INVOICE TEXT:
 ${truncated}`;
 }
 
-/** Raw payload sent to the Ollama-compatible LLM API */
+// ─── LLM call ─────────────────────────────────────────────────────────────────
+
 interface LlmPayload {
   model: string;
   prompt: string;
@@ -147,13 +143,30 @@ export async function parseInvoiceWithLlm(
     const llmData = await res.json();
     const rawText: string = llmData.response?.trim() ?? "";
 
-    // Strip markdown fences if present
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      throw new Error(`LLM response contained no JSON object. Raw: ${rawText.slice(0, 200)}`);
+      throw new Error(`LLM returned no JSON. Raw: ${rawText.slice(0, 200)}`);
     }
 
-    const result: ParsedInvoice = JSON.parse(jsonMatch[0]);
+    let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
+
+    // ── Post-process: sanitize amount ────────────────────────────────────────
+    // LLM sometimes returns amount as string "1,769.94" despite instructions
+    if (typeof result.amount === "string") {
+      result = {
+        ...result,
+        amount: parseFloat((result.amount as string).replace(/,/g, "")),
+      };
+    }
+    // If amount is still 0 or NaN, try to extract from raw OCR text
+    if (!result.amount || isNaN(result.amount)) {
+      const amountMatch = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
+                          prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
+      if (amountMatch) {
+        result.amount = parseFloat(amountMatch[1].replace(/,/g, ""));
+      }
+    }
+
     return { result, payload };
   } finally {
     clearTimeout(timer);
