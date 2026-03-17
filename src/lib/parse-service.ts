@@ -10,25 +10,31 @@ import type { ParsedInvoice } from "./types";
 /**
  * Normalizes a mobile photo before OCR:
  * 1. Auto-rotates based on EXIF orientation (fixes upside-down/sideways phone photos)
- * 2. Limits max dimension to 2400px (reduces upload time without losing OCR quality)
- * 3. Converts to JPEG for consistent OCR server handling
+ * 2. Limits max dimension to 2400px
+ * 3. Converts to JPEG
  */
 async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
-  const originalName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
+  const normalizedName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require("sharp");
     const inputBuffer = Buffer.from(await file.arrayBuffer());
 
     const outputBuffer: Buffer = await sharp(inputBuffer)
-      .rotate()                    // auto-rotate from EXIF — critical for mobile photos
+      .rotate()          // auto-rotate from EXIF — fixes sideways/upside-down mobile photos
       .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
       .jpeg({ quality: 90 })
       .toBuffer();
 
-    // Convert Buffer → Uint8Array to satisfy Blob constructor type
-    const uint8 = new Uint8Array(outputBuffer.buffer, outputBuffer.byteOffset, outputBuffer.byteLength);
-    return { blob: new Blob([uint8], { type: "image/jpeg" }), filename: originalName };
+    // Copy into a plain ArrayBuffer to avoid SharedArrayBuffer TS type issues
+    const plainArrayBuffer = outputBuffer.buffer.slice(
+      outputBuffer.byteOffset,
+      outputBuffer.byteOffset + outputBuffer.byteLength
+    );
+    return {
+      blob: new Blob([plainArrayBuffer as ArrayBuffer], { type: "image/jpeg" }),
+      filename: normalizedName,
+    };
   } catch {
     console.warn("[OCR] sharp preprocessing failed, using original file");
     return { blob: file, filename: file.name };
@@ -60,11 +66,7 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 
     const data = await res.json();
     const text: string = data.text ?? data.result ?? JSON.stringify(data);
-
-    if (!text?.trim()) {
-      throw new Error("OCR service returned empty text");
-    }
-
+    if (!text?.trim()) throw new Error("OCR service returned empty text");
     return text;
   } finally {
     clearTimeout(timer);
@@ -75,10 +77,8 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-  // Remove thousands-separator commas: 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
-  // Normalize dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }
@@ -160,20 +160,17 @@ export async function parseInvoiceWithLlm(
     const rawText: string = llmData.response?.trim() ?? "";
 
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error(`LLM returned no JSON. Raw: ${rawText.slice(0, 200)}`);
-    }
+    if (!jsonMatch) throw new Error(`LLM returned no JSON. Raw: ${rawText.slice(0, 200)}`);
 
     let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
 
-    // Sanitize amount if returned as string
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
     if (!result.amount || isNaN(result.amount)) {
-      const amountMatch = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
-                          prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
-      if (amountMatch) result.amount = parseFloat(amountMatch[1].replace(/,/g, ""));
+      const m = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
+                prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
+      if (m) result.amount = parseFloat(m[1].replace(/,/g, ""));
     }
 
     return { result, payload };
