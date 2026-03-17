@@ -3,444 +3,323 @@
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
-import type { CategoryDTO, ParsedInvoice, ParseApiResponse } from "@/lib/types";
+import type { CategoryDTO } from "@/lib/types";
 
-// ─── Local form state type ────────────────────────────────────────────────────
+type Mode = "scan" | "manual";
 
-interface InvoiceFormState {
+interface ManualFormState {
   amount: string;
   date: string;
   type: string;
   description: string;
 }
 
-const EMPTY_FORM: InvoiceFormState = {
-  amount: "",
-  date: new Date().toISOString().split("T")[0],
-  type: "",
-  description: "",
-};
-
-// ─── Component ────────────────────────────────────────────────────────────────
+const TODAY = new Date().toISOString().split("T")[0];
+const EMPTY_MANUAL: ManualFormState = { amount: "", date: TODAY, type: "", description: "" };
 
 export default function UploadPage() {
   const router = useRouter();
+  const [mode, setMode] = useState<Mode>("scan");
 
+  // ── Shared state ───────────────────────────────────────────────────────────
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
-  const [parseStatus, setParseStatus] = useState("");
-  const [parsedData, setParsedData] = useState<ParsedInvoice | null>(null);
-  const [debugData, setDebugData] = useState<ParseApiResponse["debug"] | null>(null);
-  const [showDebug, setShowDebug] = useState(false);
-
   const [categories, setCategories] = useState<CategoryDTO[]>([]);
-  const [newCatName, setNewCatName] = useState("");
-  const [isManagingCats, setIsManagingCats] = useState(false);
 
-  const [formData, setFormData] = useState<InvoiceFormState>(EMPTY_FORM);
+  // ── Scan mode state ────────────────────────────────────────────────────────
+  const [parseStatus, setParseStatus] = useState("");
+  const [parsedData, setParsedData] = useState<Record<string, unknown> | null>(null);
+  const [debugData, setDebugData] = useState<Record<string, unknown> | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [scanForm, setScanForm] = useState<ManualFormState>(EMPTY_MANUAL);
 
-  // ── Categories ──────────────────────────────────────────────────────────────
+  // ── Manual mode state ──────────────────────────────────────────────────────
+  const [manualForm, setManualForm] = useState<ManualFormState>(EMPTY_MANUAL);
 
+  // ── Categories ─────────────────────────────────────────────────────────────
   const fetchCategories = useCallback(async () => {
     try {
       const res = await fetch("/api/categories");
-      if (res.ok) {
-        const data: CategoryDTO[] = await res.json();
-        setCategories(data);
-      }
-    } catch (err) {
-      console.error("[Upload] fetchCategories:", err);
-    }
+      if (res.ok) setCategories(await res.json());
+    } catch {}
   }, []);
 
-  useEffect(() => {
-    fetchCategories();
-  }, [fetchCategories]);
+  useEffect(() => { fetchCategories(); }, [fetchCategories]);
 
-  const handleAddCategory = async () => {
-    if (!newCatName.trim()) return;
-    try {
-      const res = await fetch("/api/categories", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newCatName.trim() }),
-      });
-      if (res.ok) {
-        setNewCatName("");
-        fetchCategories();
-      }
-    } catch (err) {
-      console.error("[Upload] addCategory:", err);
-      alert("שגיאה בהוספת קטגוריה");
-    }
-  };
+  const firstCategory = categories[0]?.name ?? "אחר";
 
-  const handleDeleteCategory = async (id: string) => {
-    if (!confirm("בטוח שברצונך למחוק קטגוריה זו?")) return;
-    try {
-      await fetch(`/api/categories?id=${id}`, { method: "DELETE" });
-      fetchCategories();
-    } catch (err) {
-      console.error("[Upload] deleteCategory:", err);
-      alert("שגיאה במחיקת קטגוריה");
-    }
-  };
-
-  // ── File selection ──────────────────────────────────────────────────────────
-
+  // ── File select ────────────────────────────────────────────────────────────
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
-    setFile(selected);
-    if (selected) {
-      setParsedData(null);
-      setDebugData(null);
-    }
+    const f = e.target.files?.[0] ?? null;
+    setFile(f);
+    if (f) { setParsedData(null); setDebugData(null); setParseStatus(""); }
   };
 
-  // ── Parse ───────────────────────────────────────────────────────────────────
-
+  // ── SCAN: Parse ────────────────────────────────────────────────────────────
   const handleParse = async () => {
     if (!file) return;
     setLoading(true);
     setParseStatus("מעלה קובץ וקורא טקסט (OCR)… ייתכן שייקח עד חצי דקה.");
-
     try {
       const fd = new FormData();
       fd.append("file", file);
-
       const res = await fetch("/api/parse", { method: "POST", body: fd });
-      const result: ParseApiResponse | { error: string } = await res.json();
-
-      if (!res.ok || "error" in result) {
-        throw new Error(("error" in result ? result.error : null) ?? "שגיאה בפענוח");
-      }
-
-      const { data, debug } = result as ParseApiResponse;
-
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error ?? "שגיאה בפענוח");
       setParseStatus("פענוח הצליח! אנא אשר את הנתונים:");
-      setParsedData(data);
-      setDebugData(debug);
-      setFormData({
-        amount: data.amount?.toString() ?? "",
-        date: data.date ?? new Date().toISOString().split("T")[0],
-        type: data.type ?? categories[0]?.name ?? "",
-        description: data.description ?? "",
+      setParsedData(result.data);
+      setDebugData(result.debug);
+      setScanForm({
+        amount: result.data?.amount?.toString() ?? "",
+        date: result.data?.date ?? TODAY,
+        type: result.data?.type ?? firstCategory,
+        description: result.data?.description ?? "",
       });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      alert("שגיאה בפענוח החשבונית: " + message);
-      setParseStatus("הפענוח נכשל. ניתן להזין את הנתונים ידנית.");
+    } catch (err) {
+      alert("שגיאה בפענוח: " + (err instanceof Error ? err.message : String(err)));
+      setParseStatus("הפענוח נכשל. ניתן להזין ידנית.");
     } finally {
       setLoading(false);
     }
   };
 
-  // ── Save ────────────────────────────────────────────────────────────────────
-
-  const handleSave = async (e: React.FormEvent) => {
+  // ── Shared: Save ───────────────────────────────────────────────────────────
+  const handleSave = async (e: React.FormEvent, form: ManualFormState) => {
     e.preventDefault();
-    if (!file) return;
+    if (!file && mode === "scan") return;
     setLoading(true);
-    setParseStatus("שומר את החשבונית במסד הנתונים…");
-
     try {
       const fd = new FormData();
-      fd.append("file", file);
-      fd.append("invoiceData", JSON.stringify(formData));
-
+      if (file) fd.append("file", file);
+      fd.append("invoiceData", JSON.stringify(form));
       const res = await fetch("/api/invoices", { method: "POST", body: fd });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: "שגיאה בשמירה" }));
-        throw new Error(err.error ?? "שגיאה בשמירה");
+        throw new Error(err.error);
       }
-
       router.push("/");
       router.refresh();
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      alert("שגיאה בשמירת החשבונית: " + message);
+    } catch (err) {
+      alert("שגיאה בשמירה: " + (err instanceof Error ? err.message : String(err)));
       setLoading(false);
     }
   };
 
-  // ── Reset ───────────────────────────────────────────────────────────────────
-
   const handleReset = () => {
-    setParsedData(null);
-    setFile(null);
-    setDebugData(null);
-    setFormData(EMPTY_FORM);
-    setParseStatus("");
+    setFile(null); setParsedData(null); setDebugData(null);
+    setScanForm(EMPTY_MANUAL); setParseStatus("");
   };
 
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // ── Shared form fields component ───────────────────────────────────────────
+  const renderFormFields = (form: ManualFormState, setForm: (f: ManualFormState) => void, requireFile = false) => (
+    <>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label className="block text-sm font-bold text-gray-700 mb-1">סכום (₪)</label>
+          <input type="number" step="0.01" required
+            value={form.amount}
+            onChange={e => setForm({ ...form, amount: e.target.value })}
+            className="w-full rounded-xl border border-gray-200 p-3 focus:ring-2 focus:ring-indigo-500 outline-none text-right"
+            placeholder="0.00"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-bold text-gray-700 mb-1">תאריך</label>
+          <input type="date" required
+            value={form.date}
+            onChange={e => setForm({ ...form, date: e.target.value })}
+            className="w-full rounded-xl border border-gray-200 p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label className="block text-sm font-bold text-gray-700 mb-1">קטגוריה</label>
+          <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}
+            className="w-full rounded-xl border border-gray-200 p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
+          >
+            {categories.length > 0
+              ? categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)
+              : <>
+                  <option value="מזון">מזון</option>
+                  <option value="ביגוד">ביגוד</option>
+                  <option value="חוגים">חוגים</option>
+                  <option value="בריאות">בריאות</option>
+                  <option value="אחר">אחר</option>
+                </>
+            }
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-bold text-gray-700 mb-1">תיאור</label>
+          <input type="text"
+            value={form.description}
+            onChange={e => setForm({ ...form, description: e.target.value })}
+            className="w-full rounded-xl border border-gray-200 p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
+            placeholder="לדוגמה: נעליים לדני"
+          />
+        </div>
+      </div>
+
+      {/* File attachment — optional in manual mode */}
+      <div>
+        <label className="block text-sm font-bold text-gray-700 mb-1">
+          {requireFile ? "קובץ (חובה)" : "צרף קובץ (אופציונלי)"}
+        </label>
+        <label className="flex items-center gap-3 cursor-pointer border border-dashed border-gray-300 rounded-xl p-4 hover:bg-gray-50 transition">
+          <svg className="w-5 h-5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+          </svg>
+          <span className="text-sm text-gray-500 truncate">
+            {file ? file.name : "בחר קובץ (PDF, תמונה)"}
+          </span>
+          <input type="file" className="hidden" accept="image/*,application/pdf" onChange={handleFileSelect} />
+        </label>
+      </div>
+    </>
+  );
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       <Navbar />
-      <main className="flex-1 w-full max-w-3xl mx-auto py-6 px-4 sm:py-12 sm:px-6 lg:px-8">
+      <main className="flex-1 w-full max-w-2xl mx-auto py-6 px-4 sm:py-10">
+
+        {/* Mode toggle */}
+        <div className="flex rounded-2xl overflow-hidden border border-gray-200 mb-6 bg-white shadow-sm">
+          <button
+            onClick={() => { setMode("scan"); handleReset(); }}
+            className={`flex-1 py-3 font-bold text-sm transition flex items-center justify-center gap-2 ${mode === "scan" ? "bg-indigo-600 text-white" : "text-gray-500 hover:bg-gray-50"}`}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            סריקה אוטומטית
+          </button>
+          <button
+            onClick={() => { setMode("manual"); handleReset(); setManualForm({ ...EMPTY_MANUAL, type: firstCategory }); }}
+            className={`flex-1 py-3 font-bold text-sm transition flex items-center justify-center gap-2 ${mode === "manual" ? "bg-indigo-600 text-white" : "text-gray-500 hover:bg-gray-50"}`}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+            </svg>
+            הזנה ידנית
+          </button>
+        </div>
+
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
-          {/* Header */}
-          <div className="border-b border-gray-100 bg-gray-50 px-6 py-4 sm:px-8 sm:py-6">
-            <h1 className="text-xl sm:text-2xl font-bold text-gray-900">העלאת חשבונית חדשה</h1>
-            <p className="mt-1 text-xs sm:text-sm text-gray-500">
-              צלם או בחר קובץ, והבינה המלאכותית תפענח עבורך.
+          <div className="border-b border-gray-100 bg-gray-50 px-6 py-4">
+            <h1 className="text-lg font-bold text-gray-900">
+              {mode === "scan" ? "סריקה ופענוח חשבונית" : "הוספת הוצאה ידנית"}
+            </h1>
+            <p className="text-xs text-gray-500 mt-0.5">
+              {mode === "scan" ? "העלה קובץ והבינה המלאכותית תפענח עבורך." : "הזן את הפרטים ידנית, קובץ אופציונלי."}
             </p>
           </div>
 
-          <div className="p-6 sm:p-8">
-            {/* ── Step 1: File picker ── */}
-            {!parsedData && (
-              <div className="space-y-6">
-                <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 sm:p-10 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition">
-                  <svg
-                    className="w-10 h-10 sm:w-12 sm:h-12 text-gray-400 mb-4"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                    />
-                  </svg>
-                  <label className="cursor-pointer bg-white border border-gray-300 rounded-lg px-4 py-2 text-sm font-medium hover:bg-gray-50 transition text-gray-700 shadow-sm text-center">
-                    בחר קובץ (PDF, תמונה) או הפעל מצלמה
-                    <input
-                      type="file"
-                      className="hidden"
-                      accept="image/*,application/pdf"
-                      onChange={handleFileSelect}
-                    />
-                  </label>
-                  {file && (
-                    <p className="mt-4 text-xs sm:text-sm font-semibold text-blue-600 break-all text-center">
-                      קובץ נבחר: {file.name}
-                    </p>
-                  )}
-                </div>
+          <div className="p-6 space-y-5">
 
-                {file && (
-                  <button
-                    onClick={handleParse}
-                    disabled={loading}
-                    className="w-full bg-gradient-to-l from-blue-600 to-indigo-600 text-white py-3 rounded-xl font-bold shadow-md hover:shadow-lg hover:from-blue-700 hover:to-indigo-700 transition disabled:opacity-50 disabled:cursor-wait text-sm sm:text-base"
-                  >
-                    {loading ? parseStatus : "התחל סריקה ופענוח אוטומטי"}
-                  </button>
-                )}
+            {/* ── SCAN MODE ── */}
+            {mode === "scan" && (
+              <>
+                {!parsedData ? (
+                  <>
+                    {/* File picker */}
+                    <div className="border-2 border-dashed border-gray-200 rounded-xl p-8 flex flex-col items-center gap-4 bg-gray-50 hover:bg-gray-100 transition">
+                      <svg className="w-10 h-10 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                      </svg>
+                      <label className="cursor-pointer bg-white border border-gray-300 rounded-xl px-5 py-2.5 text-sm font-semibold hover:bg-gray-50 transition text-gray-700 shadow-sm text-center">
+                        בחר קובץ — PDF, תמונה, או צלם עם המצלמה
+                        <input type="file" className="hidden" accept="image/*,application/pdf" onChange={handleFileSelect} />
+                      </label>
+                      {file && <p className="text-sm font-semibold text-indigo-600 text-center break-all">{file.name}</p>}
+                    </div>
 
-                {loading && (
-                  <div className="flex flex-col items-center justify-center mt-4 space-y-3">
-                    <div className="w-8 h-8 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin" />
-                    <p className="text-xs sm:text-sm text-gray-600 font-medium text-center">
-                      {parseStatus}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* ── Step 2: Confirm parsed data ── */}
-            {parsedData && (
-              <form
-                onSubmit={handleSave}
-                className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500"
-              >
-                <div className="bg-green-50 border border-green-200 rounded-lg p-4 text-green-800 text-xs sm:text-sm font-medium">
-                  {parseStatus}
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
-                  {/* Amount */}
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700">סכום (₪)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      required
-                      value={formData.amount}
-                      onChange={(e) => setFormData({ ...formData, amount: e.target.value })}
-                      className="mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 py-2 px-3 text-gray-900 text-right text-sm sm:text-base"
-                    />
-                  </div>
-
-                  {/* Date */}
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700">תאריך</label>
-                    <input
-                      type="date"
-                      required
-                      value={formData.date}
-                      onChange={(e) => setFormData({ ...formData, date: e.target.value })}
-                      className="mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 py-2 px-3 text-gray-900 text-right text-sm sm:text-base"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
-                  {/* Category */}
-                  <div>
-                    <div className="flex justify-between items-center mb-1">
-                      <label className="block text-sm font-bold text-gray-700">סוג הוצאה</label>
-                      <button
-                        type="button"
-                        onClick={() => setIsManagingCats(!isManagingCats)}
-                        className="text-xs text-blue-600 font-bold hover:underline"
+                    {file && (
+                      <button onClick={handleParse} disabled={loading}
+                        className="w-full bg-gradient-to-l from-blue-600 to-indigo-600 text-white py-3.5 rounded-xl font-bold shadow-md hover:shadow-lg transition disabled:opacity-50"
                       >
-                        {isManagingCats ? "סגור ניהול" : "נהל קטגוריות"}
+                        {loading ? parseStatus : "🔍 התחל סריקה ופענוח אוטומטי"}
+                      </button>
+                    )}
+
+                    {loading && (
+                      <div className="flex flex-col items-center gap-3 py-2">
+                        <div className="w-7 h-7 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin" />
+                        <p className="text-sm text-gray-500 text-center">{parseStatus}</p>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <form onSubmit={e => handleSave(e, scanForm)} className="space-y-5 animate-in fade-in duration-300">
+                    <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-green-800 text-sm font-medium">
+                      ✅ {parseStatus}
+                    </div>
+
+                    {renderFormFields(scanForm, setScanForm)}
+
+                    <div className="flex gap-3 pt-2">
+                      <button type="submit" disabled={loading}
+                        className="flex-1 bg-green-600 text-white py-3 rounded-xl font-bold hover:bg-green-700 transition disabled:opacity-50"
+                      >
+                        {loading ? "שומר…" : "שמור"}
+                      </button>
+                      <button type="button" onClick={handleReset} disabled={loading}
+                        className="px-5 bg-gray-100 text-gray-600 py-3 rounded-xl font-bold hover:bg-gray-200 transition"
+                      >
+                        ביטול
                       </button>
                     </div>
 
-                    {isManagingCats ? (
-                      <div className="space-y-3 p-3 bg-gray-50 rounded-lg border border-gray-200">
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            placeholder="קטגוריה חדשה…"
-                            value={newCatName}
-                            onChange={(e) => setNewCatName(e.target.value)}
-                            className="flex-1 text-xs border border-gray-300 rounded px-2 py-1"
-                          />
-                          <button
-                            type="button"
-                            onClick={handleAddCategory}
-                            className="bg-blue-600 text-white text-xs px-2 py-1 rounded"
-                          >
-                            הוסף
-                          </button>
-                        </div>
-                        <ul className="max-h-32 overflow-y-auto space-y-1">
-                          {categories.map((cat) => (
-                            <li
-                              key={cat.id}
-                              className="flex justify-between items-center text-xs bg-white border border-gray-100 p-1.5 rounded"
-                            >
-                              <span>{cat.name}</span>
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteCategory(cat.id)}
-                                className="text-red-500"
-                                aria-label="מחק קטגוריה"
-                              >
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                </svg>
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : (
-                      <select
-                        value={formData.type}
-                        onChange={(e) => setFormData({ ...formData, type: e.target.value })}
-                        className="mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 py-2 px-3 text-gray-900 text-right text-sm sm:text-base"
-                      >
-                        {categories.length === 0 ? (
-                          <>
-                            <option value="מזון">מזון</option>
-                            <option value="ביגוד">ביגוד</option>
-                            <option value="חוגים">חוגים</option>
-                            <option value="בריאות">בריאות</option>
-                            <option value="אחר">אחר</option>
-                          </>
-                        ) : (
-                          categories.map((cat) => (
-                            <option key={cat.id} value={cat.name}>
-                              {cat.name}
-                            </option>
-                          ))
+                    {/* Debug panel */}
+                    {debugData && (
+                      <div className="pt-4 border-t border-gray-100">
+                        <button type="button" onClick={() => setShowDebug(!showDebug)}
+                          className="text-xs text-gray-400 flex items-center gap-1 hover:text-gray-600"
+                        >
+                          <svg className={`w-3.5 h-3.5 transition ${showDebug ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                          {showDebug ? "הסתר Debug" : "הצג Debug"}
+                        </button>
+                        {showDebug && (
+                          <div className="mt-3 space-y-3 animate-in fade-in duration-200">
+                            {["prompt", "ocrResponse"].map(k => (
+                              <div key={k} className="p-3 bg-gray-900 rounded-lg overflow-x-auto">
+                                <p className="text-blue-400 text-xs font-bold mb-1">{k}:</p>
+                                <pre className="text-gray-300 text-[10px] whitespace-pre-wrap">{String((debugData as Record<string,unknown>)[k] ?? "")}</pre>
+                              </div>
+                            ))}
+                          </div>
                         )}
-                      </select>
+                      </div>
                     )}
-                  </div>
+                  </form>
+                )}
+              </>
+            )}
 
-                  {/* Description */}
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700">תיאור קצר</label>
-                    <input
-                      type="text"
-                      value={formData.description}
-                      onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-                      className="mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 py-2 px-3 text-gray-900 text-right text-sm sm:text-base"
-                      placeholder="לדוגמה: נעליים לדני"
-                    />
-                  </div>
-                </div>
-
-                {/* Actions */}
-                <div className="pt-6 border-t border-gray-100 flex flex-col sm:flex-row gap-4">
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    className="flex-1 bg-green-600 text-white py-3 rounded-xl font-bold shadow-sm hover:bg-green-700 transition disabled:opacity-50 disabled:cursor-wait text-sm sm:text-base order-1 sm:order-2"
+            {/* ── MANUAL MODE ── */}
+            {mode === "manual" && (
+              <form onSubmit={e => handleSave(e, manualForm)} className="space-y-5">
+                {renderFormFields(manualForm, setManualForm)}
+                <div className="flex gap-3 pt-2">
+                  <button type="submit" disabled={loading}
+                    className="flex-1 bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 transition disabled:opacity-50"
                   >
-                    {loading ? "שומר…" : "שמור בחשבון שלי"}
+                    {loading ? "שומר…" : "הוסף הוצאה"}
                   </button>
-                  <button
-                    type="button"
-                    onClick={handleReset}
-                    disabled={loading}
-                    className="px-6 bg-white border border-gray-300 text-gray-700 py-3 rounded-xl font-bold shadow-sm hover:bg-gray-50 transition text-sm sm:text-base order-2 sm:order-1"
+                  <button type="button" onClick={() => router.push("/")}
+                    className="px-5 bg-gray-100 text-gray-600 py-3 rounded-xl font-bold hover:bg-gray-200 transition"
                   >
                     ביטול
                   </button>
                 </div>
-
-                {/* Debug panel */}
-                {debugData && (
-                  <div className="mt-8 pt-8 border-t border-gray-100">
-                    <button
-                      type="button"
-                      onClick={() => setShowDebug(!showDebug)}
-                      className="text-xs text-gray-500 flex items-center gap-2 hover:text-gray-800 transition"
-                    >
-                      <svg
-                        className={`w-4 h-4 transition ${showDebug ? "rotate-180" : ""}`}
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                      >
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                      </svg>
-                      {showDebug
-                        ? "הסתר נתוני שאילתה (Debug)"
-                        : "הצג את השאילתה שנשלחה לשרת (Transparency)"}
-                    </button>
-
-                    {showDebug && (
-                      <div className="mt-4 space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
-                        <div className="p-4 bg-gray-900 rounded-lg overflow-x-auto">
-                          <p className="text-blue-400 text-xs font-bold mb-2">LLM Prompt:</p>
-                          <pre className="text-gray-300 text-[10px] leading-relaxed whitespace-pre-wrap">
-                            {debugData.prompt}
-                          </pre>
-                        </div>
-                        <div className="p-4 bg-gray-900 rounded-lg overflow-x-auto">
-                          <p className="text-green-400 text-xs font-bold mb-2">
-                            OCR Output (500 chars):
-                          </p>
-                          <pre className="text-gray-300 text-[10px] leading-relaxed whitespace-pre-wrap">
-                            {debugData.ocrResponse}
-                          </pre>
-                        </div>
-                        <div className="p-4 bg-gray-900 rounded-lg overflow-x-auto">
-                          <p className="text-purple-400 text-xs font-bold mb-2">
-                            LLM Response JSON:
-                          </p>
-                          <pre className="text-gray-300 text-[10px] whitespace-pre-wrap">
-                            {JSON.stringify(parsedData, null, 2)}
-                          </pre>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
               </form>
             )}
+
           </div>
         </div>
       </main>
