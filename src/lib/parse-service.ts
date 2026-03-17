@@ -6,11 +6,47 @@
 import { AI_CONFIG } from "./config";
 import type { ParsedInvoice } from "./types";
 
+// ─── Image pre-processing ─────────────────────────────────────────────────────
+/**
+ * Normalizes a mobile photo before OCR:
+ * 1. Auto-rotates based on EXIF orientation (fixes upside-down/sideways photos)
+ * 2. Converts to JPEG if needed (some formats confuse OCR servers)
+ * 3. Limits max dimension to 2400px (reduces upload time without losing quality)
+ *
+ * Returns a new Blob ready to send as "image" to the OCR endpoint.
+ */
+async function normalizeImageForOcr(file: File): Promise<Blob> {
+  try {
+    // sharp is available server-side only — lazy import to avoid edge-runtime issues
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sharp = require("sharp");
+    const arrayBuffer = await file.arrayBuffer();
+    const inputBuffer = Buffer.from(arrayBuffer);
+
+    const outputBuffer: Buffer = await sharp(inputBuffer)
+      .rotate()                          // auto-rotate from EXIF — critical for mobile photos
+      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    return new Blob([outputBuffer], { type: "image/jpeg" });
+  } catch {
+    // If sharp fails (e.g., unsupported format), fall back to the original file
+    console.warn("[OCR] sharp preprocessing failed, using original file");
+    return file;
+  }
+}
+
 // ─── OCR ─────────────────────────────────────────────────────────────────────
 
 export async function extractTextViaOcr(file: File): Promise<string> {
+  // Normalize image (fix EXIF rotation from mobile cameras)
+  const processedBlob = await normalizeImageForOcr(file);
+
   const formData = new FormData();
-  formData.append("image", file);
+  // Use processed blob with a safe filename
+  const fileName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
+  formData.append("image", processedBlob, fileName);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
@@ -43,22 +79,17 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 // ─── Text pre-processing ──────────────────────────────────────────────────────
 /**
  * Cleans raw OCR/PDF text before sending to the LLM.
- * Key normalizations:
- * - Thousands separators: "1,769.94" → "1769.94"  (LLM sometimes reads "1" from "1,769")
- * - Hebrew thousands: "1,769.94" with RTL artifacts
- * - Normalize date separators so LLM sees consistent patterns
  */
 export function preprocessOcrText(raw: string): string {
   let text = raw;
 
   // Remove thousands-separator commas inside numbers: 1,769.94 → 1769.94
-  // Pattern: digit, comma, exactly 3 digits (optionally followed by decimal)
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
 
   // Also handle: ₪1,769 or NIS 1,769
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
 
-  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026 (easier for LLM)
+  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
 
   return text;
@@ -67,7 +98,6 @@ export function preprocessOcrText(raw: string): string {
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
 
 export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
-  // Clean text first
   const ocrText = preprocessOcrText(rawOcrText);
   const truncated = ocrText.substring(0, AI_CONFIG.llmMaxChars);
   const catList = categories.map((c) => `"${c}"`).join(", ");
@@ -150,15 +180,10 @@ export async function parseInvoiceWithLlm(
 
     let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
 
-    // ── Post-process: sanitize amount ────────────────────────────────────────
-    // LLM sometimes returns amount as string "1,769.94" despite instructions
+    // Post-process: sanitize amount if LLM returned it as string
     if (typeof result.amount === "string") {
-      result = {
-        ...result,
-        amount: parseFloat((result.amount as string).replace(/,/g, "")),
-      };
+      result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
-    // If amount is still 0 or NaN, try to extract from raw OCR text
     if (!result.amount || isNaN(result.amount)) {
       const amountMatch = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
                           prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
