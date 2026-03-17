@@ -77,48 +77,121 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
+  // Remove thousands-separator commas: 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
+  // Normalize dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }
 
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
 
+/**
+ * Builds a rich prompt for invoice parsing.
+ *
+ * Key design decisions:
+ * - Step 1: Extract business name FIRST (before categorizing) — forces the model
+ *   to ground itself in the actual invoice content before guessing a category.
+ * - Categories come from the DB (user-defined) with examples so the model understands
+ *   the *intent* behind each category, not just the Hebrew label.
+ * - Two-pass description: business name + what was bought = useful, searchable description.
+ * - Explicit Israeli context: Israeli chains, Hebrew/English mixed receipts.
+ */
 export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
   const ocrText = preprocessOcrText(rawOcrText);
   const truncated = ocrText.substring(0, AI_CONFIG.llmMaxChars);
-  const catList = categories.map((c) => `"${c}"`).join(", ");
   const today = new Date().toISOString().split("T")[0];
 
-  return `You are an expert invoice data extraction assistant. Extract structured data from the invoice text below. The text may be in Hebrew or English.
+  // Build a rich category list with matching hints
+  // This is the KEY improvement — the model sees the actual category names from the DB
+  // plus examples of what belongs there, so it can fuzzy-match even unusual names
+  const categoryGuide = categories
+    .map((name) => {
+      const examples = getCategoryExamples(name);
+      return examples
+        ? `  • "${name}" — לדוגמה: ${examples}`
+        : `  • "${name}"`;
+    })
+    .join("\n");
 
-EXTRACTION RULES:
+  return `אתה מומחה לחילוץ נתונים מחשבוניות ישראליות. משימתך: לחלץ מידע מובנה מטקסט OCR של חשבונית או קבלה.
+הטקסט עשוי להיות בעברית, אנגלית, או שילוב. יתכנו שגיאות OCR.
 
-1. AMOUNT (number, NO commas, NO currency symbols):
-   - Find the TOTAL amount paid. Look for: סה"כ, סה"כ לתשלום, לתשלום, Total, Grand Total, Amount Due
-   - CRITICAL: Numbers may appear as "1769.94" or "1,769.94" — strip ALL commas, return only digits and decimal point
-   - Return as plain number: 1769.94 (NOT "1,769.94", NOT "₪1769")
-   - If VAT (מע"מ) is listed separately, the total already includes it
+━━━ שלב 1: זיהוי העסק ━━━
+לפני הכל — מצא את שם העסק/המקום בחשבונית.
+חפש: שם בראש הקבלה, לוגו, "שם העסק:", כתובת עם שם.
+דוגמאות לעסקים ישראליים: שופרסל, רמי לוי, מגה, ויקטורי, AM:PM, סופר-פארם, NEW PHARM,
+קופת חולים, מאוחדת, כללית, מכבי, שלמה סיקסט, YES, HOT, חברת החשמל, בזק,
+מזדו בכפר, בורגר קינג, מקדונלד'ס, אלקטרה, שאגה, נייס, H&M, ZARA, רנואר.
+אם לא מזהה שם ברור — כתוב "לא ידוע".
 
-2. DATE (YYYY-MM-DD):
-   - Look for: תאריך, Date, שולם ב
-   - Formats: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
-   - Convert DD/MM/YYYY → YYYY-MM-DD (example: 15/03/2026 → 2026-03-15)
-   - Fallback: today = ${today}
+━━━ שלב 2: חילוץ נתונים ━━━
 
-3. TYPE — must be exactly one of: [${catList}]
-   - Match by content: electricity/חשמל → utility; supermarket/מכולת → food
-   - Never invent a new category
+1. AMOUNT (מספר בלבד, ללא פסיקים, ללא סמל מטבע):
+   • חפש: סה"כ, סה"כ לתשלום, לתשלום, סכום, Total, Grand Total, Amount Due
+   • חשוב מאוד: "1,769.94" → 1769.94 (הסר את הפסיק, שמור נקודה עשרונית)
+   • אם יש מע"מ נפרד — הסכום הסופי כבר כולל אותו
+   • החזר מספר בלבד: 310.50 ולא "₪310.50" ולא "310,50"
 
-4. DESCRIPTION (Hebrew, 3-6 words):
-   - e.g.: "קניות סופרמרקט", "חשבון חשמל פברואר", "נעליים לילד"
+2. DATE (פורמט YYYY-MM-DD):
+   • חפש: תאריך, Date, שולם ב, דפוס: DD/MM/YYYY או DD.MM.YYYY
+   • המר: 15/03/2026 → 2026-03-15
+   • ברירת מחדל אם לא נמצא: ${today}
 
-OUTPUT — return ONLY this JSON, no other text:
-{"amount": <number>, "date": "<YYYY-MM-DD>", "type": "<category>", "description": "<hebrew description>"}
+3. TYPE (חובה — בחר בדיוק אחת מהקטגוריות הבאות):
+${categoryGuide}
+   • התאם לפי שם העסק שמצאת בשלב 1 + תוכן הקבלה
+   • אם לא ברור — בחר את הקרובה ביותר מהרשימה
+   • אסור להמציא קטגוריה חדשה שאינה ברשימה
 
-INVOICE TEXT:
+4. DESCRIPTION (עברית, 3-6 מילים):
+   • פורמט מועדף: "[שם העסק] — [מה נרכש]"
+   • דוגמאות טובות: "שופרסל — קניות שבועיות", "קופת חולים — ביקור רופא", "חברת החשמל — חשבון פברואר"
+   • אם שם העסק לא ידוע: תאר רק את מה שנרכש, למשל: "ביגוד לילדים", "תרופות מבית מרקחת"
+
+━━━ פלט ━━━
+החזר JSON בלבד — ללא הסברים, ללא markdown, ללא טקסט נוסף:
+{"amount": <number>, "date": "<YYYY-MM-DD>", "type": "<category>", "description": "<description>"}
+
+━━━ טקסט החשבונית ━━━
 ${truncated}`;
+}
+
+/**
+ * Returns matching examples for known category name patterns.
+ * Works with ANY category name — tries to match by keywords in the name.
+ * If no match found, returns null (category shown without examples).
+ */
+function getCategoryExamples(categoryName: string): string | null {
+  const name = categoryName.toLowerCase();
+
+  if (/מזון|אוכל|מכולת|סופר|קניות|food|grocery/.test(name)) {
+    return "שופרסל, רמי לוי, מגה, ויקטורי, AM:PM, מסעדה, קפה, מאפייה";
+  }
+  if (/ביגוד|בגדים|הנעלה|נעל|אופנה|clothes|fashion/.test(name)) {
+    return "H&M, ZARA, נייס, רנואר, קסטרו, FOX, נעליים, ביגוד ילדים";
+  }
+  if (/בריאות|רפואי|רפואה|רופא|תרופ|קופת|מרפאה|health|medical|pharma/.test(name)) {
+    return "קופת חולים, מאוחדת, כללית, מכבי, סופר-פארם, NEW PHARM, שב\"ן, ביקור רופא";
+  }
+  if (/חוג|חינוך|לימוד|קורס|כיתה|בית ספר|גן|שיעור|class|edu/.test(name)) {
+    return "גן ילדים, חוג ספורט, שיעורי מוזיקה, בית ספר, קורס אמנות";
+  }
+  if (/חשמל|מים|גז|ארנונה|ועד|תשתית|ספק|utility|electric|water/.test(name)) {
+    return "חברת חשמל, מקורות, בזק, HOT, YES, ועד בית, ארנונה";
+  }
+  if (/תחבורה|נסיעה|רכב|דלק|חניה|taxi|transport|car|fuel/.test(name)) {
+    return "דלק, פז, סונול, חניה, רב-קו, מונית, אוטובוס";
+  }
+  if (/ספורט|כושר|gym|sport|fitness/.test(name)) {
+    return "מכון כושר, ציוד ספורט, מנוי ספורט";
+  }
+  if (/אחר|other|כללי|misc/.test(name)) {
+    return "כל מה שלא משתייך לקטגוריה אחרת";
+  }
+
+  return null; // Unknown category — show as-is without examples
 }
 
 // ─── LLM call ─────────────────────────────────────────────────────────────────
@@ -164,6 +237,7 @@ export async function parseInvoiceWithLlm(
 
     let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
 
+    // Sanitize amount if returned as string
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
