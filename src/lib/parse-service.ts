@@ -7,26 +7,17 @@ import { AI_CONFIG } from "./config";
 import type { ParsedInvoice } from "./types";
 
 // ─── Image pre-processing ─────────────────────────────────────────────────────
-/**
- * Normalizes a mobile photo before OCR:
- * 1. Auto-rotates based on EXIF orientation (fixes upside-down/sideways phone photos)
- * 2. Limits max dimension to 2400px
- * 3. Converts to JPEG
- */
 async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
   const normalizedName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require("sharp");
     const inputBuffer = Buffer.from(await file.arrayBuffer());
-
     const outputBuffer: Buffer = await sharp(inputBuffer)
-      .rotate()          // auto-rotate from EXIF — fixes sideways/upside-down mobile photos
+      .rotate()
       .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
       .jpeg({ quality: 90 })
       .toBuffer();
-
-    // Copy into a plain ArrayBuffer to avoid SharedArrayBuffer TS type issues
     const plainArrayBuffer = outputBuffer.buffer.slice(
       outputBuffer.byteOffset,
       outputBuffer.byteOffset + outputBuffer.byteLength
@@ -45,25 +36,20 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
 
 export async function extractTextViaOcr(file: File): Promise<string> {
   const { blob, filename } = await normalizeImageForOcr(file);
-
   const formData = new FormData();
   formData.append("image", blob, filename);
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
-
   try {
     const res = await fetch(AI_CONFIG.ocrUrl, {
       method: "POST",
       body: formData,
       signal: controller.signal,
     });
-
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       throw new Error(`OCR service returned ${res.status}: ${detail}`);
     }
-
     const data = await res.json();
     const text: string = data.text ?? data.result ?? JSON.stringify(data);
     if (!text?.trim()) throw new Error("OCR service returned empty text");
@@ -77,81 +63,114 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-  // Remove thousands-separator commas: 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
-  // Normalize dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }
 
+// ─── Business name extraction ─────────────────────────────────────────────────
+/**
+ * Extracts the business name from the FIRST few lines of the OCR text.
+ *
+ * Strategy (in order of priority):
+ * 1. Line containing "בע\"מ" / "בע'מ" / "Ltd" / "LLC" — classic Israeli business name
+ * 2. Line containing "שם העסק:" / "עסק:" / "מסעדה:" / "חנות:" prefix
+ * 3. Very first non-empty line (receipts almost always start with business name)
+ * 4. Second line if first is mostly numbers/symbols
+ *
+ * We look only at the first 8 lines to avoid false-positives from middle of receipt.
+ */
+export function extractBusinessName(ocrText: string): string {
+  const lines = ocrText
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 1); // remove empty / single-char lines
+
+  const top = lines.slice(0, 8); // only look at the top of the receipt
+
+  // Priority 1: line with בע"מ / Ltd / בע'מ — the official business name
+  const companyLine = top.find(l =>
+    /בע[""']מ|בע"מ|בעמ|ltd\.?|llc\.?|inc\.?/i.test(l)
+  );
+  if (companyLine) {
+    // Clean up: remove noise like phone numbers, addresses
+    return companyLine.replace(/\d{2,}-\d{4,}/g, "").trim();
+  }
+
+  // Priority 2: explicit label prefix
+  const labelLine = top.find(l =>
+    /^(שם העסק|עסק|מסעדה|חנות|סניף|name)\s*[:\-]/i.test(l)
+  );
+  if (labelLine) {
+    return labelLine.replace(/^[^:\-]+[:\-]\s*/, "").trim();
+  }
+
+  // Priority 3: first line that is mostly Hebrew/Latin text (not numbers/symbols)
+  const textLine = top.find(l => {
+    const hebrewOrLatin = l.replace(/[^א-תa-z\s]/gi, "").trim();
+    return hebrewOrLatin.length >= 3 && hebrewOrLatin.length >= l.length * 0.4;
+  });
+  if (textLine) return textLine.trim();
+
+  // Priority 4: just the first non-empty line
+  return top[0] ?? "לא ידוע";
+}
+
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
 
-/**
- * Builds a rich prompt for invoice parsing.
- *
- * Key design decisions:
- * - Step 1: Extract business name FIRST (before categorizing) — forces the model
- *   to ground itself in the actual invoice content before guessing a category.
- * - Categories come from the DB (user-defined) with examples so the model understands
- *   the *intent* behind each category, not just the Hebrew label.
- * - Two-pass description: business name + what was bought = useful, searchable description.
- * - Explicit Israeli context: Israeli chains, Hebrew/English mixed receipts.
- */
 export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
   const ocrText = preprocessOcrText(rawOcrText);
   const truncated = ocrText.substring(0, AI_CONFIG.llmMaxChars);
   const today = new Date().toISOString().split("T")[0];
 
-  // Build a rich category list with matching hints
-  // This is the KEY improvement — the model sees the actual category names from the DB
-  // plus examples of what belongs there, so it can fuzzy-match even unusual names
+  // Pre-extract business name server-side and inject it into the prompt.
+  // This anchors the model to the correct business before it reads the full text,
+  // preventing false matches like reading "CLUB" and thinking "קופת חולים".
+  const businessName = extractBusinessName(ocrText);
+
+  // Build category list — user's actual DB categories + keyword hints
+  // so the model understands the *intent* without inventing new ones
   const categoryGuide = categories
-    .map((name) => {
-      const examples = getCategoryExamples(name);
-      return examples
-        ? `  • "${name}" — לדוגמה: ${examples}`
-        : `  • "${name}"`;
+    .map(name => {
+      const hint = getCategoryHint(name);
+      return hint ? `  • "${name}" (${hint})` : `  • "${name}"`;
     })
     .join("\n");
 
-  return `אתה מומחה לחילוץ נתונים מחשבוניות ישראליות. משימתך: לחלץ מידע מובנה מטקסט OCR של חשבונית או קבלה.
+  return `אתה מומחה לחילוץ נתונים מחשבוניות ישראליות. חלץ מידע מובנה מטקסט OCR של חשבונית/קבלה.
 הטקסט עשוי להיות בעברית, אנגלית, או שילוב. יתכנו שגיאות OCR.
 
-━━━ שלב 1: זיהוי העסק ━━━
-לפני הכל — מצא את שם העסק/המקום בחשבונית.
-חפש: שם בראש הקבלה, לוגו, "שם העסק:", כתובת עם שם.
-דוגמאות לעסקים ישראליים: שופרסל, רמי לוי, מגה, ויקטורי, AM:PM, סופר-פארם, NEW PHARM,
-קופת חולים, מאוחדת, כללית, מכבי, שלמה סיקסט, YES, HOT, חברת החשמל, בזק,
-מזדו בכפר, בורגר קינג, מקדונלד'ס, אלקטרה, שאגה, נייס, H&M, ZARA, רנואר.
-אם לא מזהה שם ברור — כתוב "לא ידוע".
+━━━ שם העסק (זוהה מראש) ━━━
+שם העסק בחשבונית זו הוא: "${businessName}"
+השתמש במידע זה לקביעת הקטגוריה והתיאור. אל תחפש שם עסק אחר.
 
-━━━ שלב 2: חילוץ נתונים ━━━
+━━━ חוקי חילוץ ━━━
 
-1. AMOUNT (מספר בלבד, ללא פסיקים, ללא סמל מטבע):
+1. AMOUNT — הסכום הכולל לתשלום (מספר בלבד, ללא פסיקים, ללא סמל מטבע):
    • חפש: סה"כ, סה"כ לתשלום, לתשלום, סכום, Total, Grand Total, Amount Due
-   • חשוב מאוד: "1,769.94" → 1769.94 (הסר את הפסיק, שמור נקודה עשרונית)
-   • אם יש מע"מ נפרד — הסכום הסופי כבר כולל אותו
-   • החזר מספר בלבד: 310.50 ולא "₪310.50" ולא "310,50"
+   • "1,769.94" → 1769.94 | "310.50" → 310.50
+   • החזר מספר בלבד, לדוגמה: 310.5
 
-2. DATE (פורמט YYYY-MM-DD):
-   • חפש: תאריך, Date, שולם ב, דפוס: DD/MM/YYYY או DD.MM.YYYY
+2. DATE — תאריך החשבונית (YYYY-MM-DD):
+   • פורמטים: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
    • המר: 15/03/2026 → 2026-03-15
-   • ברירת מחדל אם לא נמצא: ${today}
+   • ברירת מחדל: ${today}
 
-3. TYPE (חובה — בחר בדיוק אחת מהקטגוריות הבאות):
+3. TYPE — בחר בדיוק אחת מהקטגוריות הבאות בהתאם לשם העסק "${businessName}" ולפריטים:
 ${categoryGuide}
-   • התאם לפי שם העסק שמצאת בשלב 1 + תוכן הקבלה
-   • אם לא ברור — בחר את הקרובה ביותר מהרשימה
-   • אסור להמציא קטגוריה חדשה שאינה ברשימה
+   • התאם לפי: שם העסק + הפריטים שנרכשו
+   • אם שם העסק הוא חנות מכולת/סופרמרקט → קטגוריית מזון
+   • אם שם העסק הוא רופא/בית מרקחת/קופת חולים → קטגוריית בריאות
+   • אל תמציא קטגוריה שאינה ברשימה
 
-4. DESCRIPTION (עברית, 3-6 מילים):
-   • פורמט מועדף: "[שם העסק] — [מה נרכש]"
-   • דוגמאות טובות: "שופרסל — קניות שבועיות", "קופת חולים — ביקור רופא", "חברת החשמל — חשבון פברואר"
-   • אם שם העסק לא ידוע: תאר רק את מה שנרכש, למשל: "ביגוד לילדים", "תרופות מבית מרקחת"
+4. DESCRIPTION — תיאור קצר בעברית (3-6 מילים):
+   • פורמט: "[שם עסק] — [תיאור מה נרכש]"
+   • דוגמאות: "מזדו בכפר 23 — קניות מכולת" | "סופר-פארם — תרופות" | "חברת החשמל — חשבון חודשי"
+   • אם הפריטים לא ברורים: "[שם עסק] — קנייה"
 
 ━━━ פלט ━━━
-החזר JSON בלבד — ללא הסברים, ללא markdown, ללא טקסט נוסף:
+JSON בלבד, ללא הסברים, ללא markdown:
 {"amount": <number>, "date": "<YYYY-MM-DD>", "type": "<category>", "description": "<description>"}
 
 ━━━ טקסט החשבונית ━━━
@@ -159,39 +178,27 @@ ${truncated}`;
 }
 
 /**
- * Returns matching examples for known category name patterns.
- * Works with ANY category name — tries to match by keywords in the name.
- * If no match found, returns null (category shown without examples).
+ * Returns a SHORT keyword hint for a category name.
+ * Used to help the model understand intent — NOT to give examples from real receipts
+ * (which caused false-positives like "CLUB" → "קופת חולים").
  */
-function getCategoryExamples(categoryName: string): string | null {
-  const name = categoryName.toLowerCase();
-
-  if (/מזון|אוכל|מכולת|סופר|קניות|food|grocery/.test(name)) {
-    return "שופרסל, רמי לוי, מגה, ויקטורי, AM:PM, מסעדה, קפה, מאפייה";
-  }
-  if (/ביגוד|בגדים|הנעלה|נעל|אופנה|clothes|fashion/.test(name)) {
-    return "H&M, ZARA, נייס, רנואר, קסטרו, FOX, נעליים, ביגוד ילדים";
-  }
-  if (/בריאות|רפואי|רפואה|רופא|תרופ|קופת|מרפאה|health|medical|pharma/.test(name)) {
-    return "קופת חולים, מאוחדת, כללית, מכבי, סופר-פארם, NEW PHARM, שב\"ן, ביקור רופא";
-  }
-  if (/חוג|חינוך|לימוד|קורס|כיתה|בית ספר|גן|שיעור|class|edu/.test(name)) {
-    return "גן ילדים, חוג ספורט, שיעורי מוזיקה, בית ספר, קורס אמנות";
-  }
-  if (/חשמל|מים|גז|ארנונה|ועד|תשתית|ספק|utility|electric|water/.test(name)) {
-    return "חברת חשמל, מקורות, בזק, HOT, YES, ועד בית, ארנונה";
-  }
-  if (/תחבורה|נסיעה|רכב|דלק|חניה|taxi|transport|car|fuel/.test(name)) {
-    return "דלק, פז, סונול, חניה, רב-קו, מונית, אוטובוס";
-  }
-  if (/ספורט|כושר|gym|sport|fitness/.test(name)) {
-    return "מכון כושר, ציוד ספורט, מנוי ספורט";
-  }
-  if (/אחר|other|כללי|misc/.test(name)) {
-    return "כל מה שלא משתייך לקטגוריה אחרת";
-  }
-
-  return null; // Unknown category — show as-is without examples
+function getCategoryHint(categoryName: string): string | null {
+  const n = categoryName.toLowerCase();
+  if (/מזון|אוכל|מכולת|סופר|קניות|food|grocery/.test(n))
+    return "סופרמרקט, מכולת, מסעדה, קפה";
+  if (/ביגוד|בגדים|הנעלה|נעל|אופנה|clothes|fashion/.test(n))
+    return "חנות בגדים, נעליים, אופנה";
+  if (/בריאות|רפואי|רפואה|רופא|תרופ|קופת|מרפאה|health|medical|pharma/.test(n))
+    return "רופא, בית מרקחת, קופת חולים, אופטיקה";
+  if (/חוג|חינוך|לימוד|קורס|בית ספר|גן|שיעור|class|edu/.test(n))
+    return "גן, חוג, שיעורים, קורס";
+  if (/חשמל|מים|גז|ארנונה|ועד|תשתית|utility|electric|water/.test(n))
+    return "חברת חשמל, בזק, מים, ארנונה";
+  if (/תחבורה|נסיעה|רכב|דלק|חניה|transport|car|fuel/.test(n))
+    return "דלק, חניה, נסיעות";
+  if (/ספורט|כושר|gym|sport|fitness/.test(n))
+    return "מכון כושר, ציוד ספורט";
+  return null;
 }
 
 // ─── LLM call ─────────────────────────────────────────────────────────────────
@@ -212,10 +219,8 @@ export async function parseInvoiceWithLlm(
     stream: false,
     format: "json",
   };
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
-
   try {
     const res = await fetch(AI_CONFIG.llmUrl, {
       method: "POST",
@@ -223,21 +228,15 @@ export async function parseInvoiceWithLlm(
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       throw new Error(`LLM service returned ${res.status}: ${detail}`);
     }
-
     const llmData = await res.json();
     const rawText: string = llmData.response?.trim() ?? "";
-
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error(`LLM returned no JSON. Raw: ${rawText.slice(0, 200)}`);
-
     let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
-
-    // Sanitize amount if returned as string
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
@@ -246,7 +245,6 @@ export async function parseInvoiceWithLlm(
                 prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
       if (m) result.amount = parseFloat(m[1].replace(/,/g, ""));
     }
-
     return { result, payload };
   } finally {
     clearTimeout(timer);
