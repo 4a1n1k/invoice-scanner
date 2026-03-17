@@ -37,8 +37,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules/.prisma  ./node_modu
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@prisma  ./node_modules/@prisma
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules/prisma   ./node_modules/prisma
 
-# pdf-parse — uses dynamic require() so Next.js standalone misses it
+# Dynamic-require packages not bundled by Next.js standalone
 COPY --from=builder /app/node_modules/pdf-parse  ./node_modules/pdf-parse
+COPY --from=builder /app/node_modules/adm-zip    ./node_modules/adm-zip
 
 # Next.js standalone bundle
 COPY --from=builder /app/public                                        ./public
