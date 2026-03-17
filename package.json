@@ -11,6 +11,8 @@
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.1",
     "@prisma/client": "5.22.0",
+    "@types/adm-zip": "^0.5.8",
+    "adm-zip": "^0.5.16",
     "bcryptjs": "^3.0.3",
     "jspdf": "^4.2.1",
     "jspdf-autotable": "^5.0.7",

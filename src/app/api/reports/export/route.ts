@@ -20,52 +20,61 @@ export async function GET(req: NextRequest) {
 
     const startDate = new Date(startDateStr);
     const endDate = new Date(endDateStr);
-    // Include the entire end date by setting time to 23:59:59
     endDate.setHours(23, 59, 59, 999);
 
     const invoices = await prisma.invoice.findMany({
       where: {
         userId: session.user.id,
-        date: {
-          gte: startDate,
-          lte: endDate,
-        },
+        date: { gte: startDate, lte: endDate },
       },
       orderBy: { date: "asc" },
     });
 
-    const host = req.headers.get("host");
-    const protocol = process.env.NODE_ENV === "development" ? "http" : "https";
-    const baseUrl = `${protocol}://${host}`;
-
-    // Map data for Excel
-    const excelData = invoices.map((inv: any) => ({
-      "תאריך": new Date(inv.date).toLocaleDateString('he-IL'),
-      "סכום": inv.amount,
-      "סוג הוצאה": inv.expenseType,
-      "תיאור": inv.description || "",
-      "קישור לקובץ (מצריך התחברות)": `${baseUrl}/api/files/${inv.id}`,
-    }));
-
-    if (excelData.length === 0) {
+    if (invoices.length === 0) {
       return new NextResponse("No invoices found in this date range", { status: 404 });
     }
 
-    // Create workbook
+    const total = invoices.reduce((s, i) => s + i.amount, 0);
+
+    // ── Build rows ────────────────────────────────────────────────────────────
+    const excelData = invoices.map((inv) => ({
+      "תאריך": new Date(inv.date).toLocaleDateString("he-IL"),
+      "סכום (₪)": inv.amount,
+      "קטגוריה": inv.expenseType,
+      "תיאור": inv.description ?? "",
+      "שם קובץ מקורי": inv.originalName ?? "",
+    }));
+
+    // Add totals row
+    excelData.push({
+      "תאריך": "",
+      "סכום (₪)": total,
+      "קטגוריה": `סה"כ (${invoices.length} חשבוניות)`,
+      "תיאור": "",
+      "שם קובץ מקורי": "",
+    });
+
+    // ── Build workbook ────────────────────────────────────────────────────────
     const wb = xlsx.utils.book_new();
     const ws = xlsx.utils.json_to_sheet(excelData);
-    
-    // Add RTL (Right To Left) formatting to sheet
-    ws['!dir'] = 'rtl';
-    
-    // Set column widths
-    ws['!cols'] = [
-      { wch: 15 }, // Date
-      { wch: 10 }, // Amount
-      { wch: 20 }, // Type
-      { wch: 30 }, // Description
-      { wch: 80 }  // Link
+
+    ws["!dir"] = "rtl";
+    ws["!cols"] = [
+      { wch: 14 }, // Date
+      { wch: 12 }, // Amount
+      { wch: 20 }, // Category
+      { wch: 35 }, // Description
+      { wch: 40 }, // Filename
     ];
+
+    // Bold the totals row
+    const lastRow = excelData.length + 1; // 1-indexed + header
+    ["A", "B", "C", "D", "E"].forEach((col) => {
+      const cellRef = `${col}${lastRow}`;
+      if (ws[cellRef]) {
+        ws[cellRef].s = { font: { bold: true } };
+      }
+    });
 
     xlsx.utils.book_append_sheet(wb, ws, "הוצאות ילדים");
 
@@ -77,9 +86,9 @@ export async function GET(req: NextRequest) {
         "Content-Disposition": `attachment; filename="invoices_${startDateStr}_to_${endDateStr}.xlsx"`,
       },
     });
-
-  } catch (err: any) {
-    console.error("Export Error:", err);
-    return new NextResponse("Internal Server Error: " + err.message, { status: 500 });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Export Error:", message);
+    return new NextResponse("Internal Server Error: " + message, { status: 500 });
   }
 }

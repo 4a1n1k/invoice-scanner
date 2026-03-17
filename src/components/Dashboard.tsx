@@ -20,6 +20,7 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
   const [loading, setLoading] = useState(false);
   const [editingInvoice, setEditingInvoice] = useState<InvoiceDTO | null>(null);
   const [categories, setCategories] = useState<CategoryDTO[]>([]);
+  const [zipLoading, setZipLoading] = useState(false);
 
   const fetchInvoices = useCallback(async (date: Date) => {
     setLoading(true);
@@ -27,12 +28,9 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
       const year = date.getFullYear();
       const month = date.getMonth() + 1;
       const res = await fetch(`/api/reports/data?year=${year}&month=${month}`);
-      if (res.ok) {
-        const data: InvoiceDTO[] = await res.json();
-        setInvoices(data);
-      }
+      if (res.ok) setInvoices(await res.json());
     } catch (err) {
-      console.error("[Dashboard] fetchInvoices error:", err);
+      console.error("[Dashboard] fetchInvoices:", err);
     } finally {
       setLoading(false);
     }
@@ -41,12 +39,9 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
   const fetchCategories = useCallback(async () => {
     try {
       const res = await fetch("/api/categories");
-      if (res.ok) {
-        const data: CategoryDTO[] = await res.json();
-        setCategories(data);
-      }
+      if (res.ok) setCategories(await res.json());
     } catch (err) {
-      console.error("[Dashboard] fetchCategories error:", err);
+      console.error("[Dashboard] fetchCategories:", err);
     }
   }, []);
 
@@ -55,21 +50,39 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
     fetchCategories();
   }, [currentDate, fetchInvoices, fetchCategories]);
 
-  // ── RTL-aware navigation ─────────────────────────────────────────────────────
-  // In RTL layout: right button → goes FORWARD (next month)
-  //                left button  → goes BACKWARD (prev month)
-  const handlePrevMonth = () =>
-    setCurrentDate((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1));
-  const handleNextMonth = () =>
-    setCurrentDate((d) => new Date(d.getFullYear(), d.getMonth() + 1, 1));
+  const handlePrevMonth = () => setCurrentDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1));
+  const handleNextMonth = () => setCurrentDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1));
 
   function monthRange() {
-    const start = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1)
-      .toISOString().split("T")[0];
-    const end = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0)
-      .toISOString().split("T")[0];
+    const start = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1).toISOString().split("T")[0];
+    const end = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0).toISOString().split("T")[0];
     return { start, end };
   }
+
+  // ── ZIP download (with loading state) ───────────────────────────────────────
+  const handleDownloadZip = async () => {
+    const { start, end } = monthRange();
+    setZipLoading(true);
+    try {
+      const res = await fetch(`/api/reports/download-zip?start=${start}&end=${end}`);
+      if (!res.ok) {
+        const text = await res.text();
+        alert("שגיאה בהורדת הקבצים: " + text);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `invoices_${start}_${end}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert("שגיאה בהורדה: " + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setZipLoading(false);
+    }
+  };
 
   const handleUpdateInvoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,15 +98,9 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
           description: editingInvoice.description,
         }),
       });
-      if (res.ok) {
-        setEditingInvoice(null);
-        fetchInvoices(currentDate);
-      } else {
-        alert("שגיאה בעדכון החשבונית");
-      }
-    } catch (err) {
-      console.error("[Dashboard] updateInvoice error:", err);
-    }
+      if (res.ok) { setEditingInvoice(null); fetchInvoices(currentDate); }
+      else alert("שגיאה בעדכון החשבונית");
+    } catch (err) { console.error(err); }
   };
 
   const handleDeleteInvoice = async (id: string) => {
@@ -101,9 +108,7 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
     try {
       const res = await fetch(`/api/invoices/${id}`, { method: "DELETE" });
       if (res.ok) fetchInvoices(currentDate);
-    } catch (err) {
-      console.error("[Dashboard] deleteInvoice error:", err);
-    }
+    } catch (err) { console.error(err); }
   };
 
   const totalAmount = invoices.reduce((sum, inv) => sum + inv.amount, 0);
@@ -120,44 +125,26 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
             סיכום הוצאות לחודש {MONTH_NAMES[currentDate.getMonth()]} {currentDate.getFullYear()}
           </p>
         </div>
-        <div className="flex gap-3 w-full md:w-auto">
-          <Link
-            href="/upload"
-            className="flex-1 md:flex-none text-center bg-indigo-600 text-white px-6 py-3 rounded-2xl font-bold hover:bg-indigo-700 transition shadow-lg shadow-indigo-200"
-          >
-            + הוסף חשבונית
-          </Link>
-        </div>
+        <Link href="/upload"
+          className="w-full md:w-auto text-center bg-indigo-600 text-white px-6 py-3 rounded-2xl font-bold hover:bg-indigo-700 transition shadow-lg shadow-indigo-200">
+          + הוסף חשבונית
+        </Link>
       </div>
 
       {/* Month selector + Total */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <div className="md:col-span-2 glass-card rounded-3xl p-6 flex items-center justify-between">
-          {/*
-            RTL layout: right side = visual "forward" = next month → chevron-left icon (‹)
-                         left side  = visual "back"    = prev month → chevron-right icon (›)
-          */}
-          <button
-            onClick={handleNextMonth}
-            aria-label="חודש הבא"
-            className="p-2 hover:bg-gray-100 rounded-full transition"
-          >
-            {/* Points LEFT — in RTL this means "go to next/newer month" */}
+          <button onClick={handleNextMonth} aria-label="חודש הבא"
+            className="p-2 hover:bg-gray-100 rounded-full transition">
             <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
             </svg>
           </button>
-
           <div className="text-xl font-bold text-gray-800">
             {MONTH_NAMES[currentDate.getMonth()]} {currentDate.getFullYear()}
           </div>
-
-          <button
-            onClick={handlePrevMonth}
-            aria-label="חודש קודם"
-            className="p-2 hover:bg-gray-100 rounded-full transition"
-          >
-            {/* Points RIGHT — in RTL this means "go to prev/older month" */}
+          <button onClick={handlePrevMonth} aria-label="חודש קודם"
+            className="p-2 hover:bg-gray-100 rounded-full transition">
             <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
             </svg>
@@ -172,22 +159,30 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
 
       {/* Invoice table */}
       <div className="glass-card rounded-3xl overflow-hidden">
-        <div className="px-8 py-6 border-b border-gray-100 flex justify-between items-center flex-wrap gap-3">
+        <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-center flex-wrap gap-3">
           <h3 className="text-lg font-bold text-gray-800">פירוט חשבוניות</h3>
-          <div className="flex gap-2">
-            <a
-              href={`/api/reports/export?start=${start}&end=${end}`}
-              className="text-xs font-bold bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-1.5 rounded-lg hover:bg-emerald-100 transition flex items-center gap-1"
-            >
+          <div className="flex gap-2 flex-wrap">
+            {/* ZIP download */}
+            <button onClick={handleDownloadZip} disabled={zipLoading || invoices.length === 0}
+              className="text-xs font-bold bg-violet-50 border border-violet-200 text-violet-700 px-3 py-1.5 rounded-lg hover:bg-violet-100 transition flex items-center gap-1.5 disabled:opacity-40">
+              {zipLoading
+                ? <><span className="w-3 h-3 border-2 border-violet-400 border-t-transparent rounded-full animate-spin inline-block" /> מכין…</>
+                : <><svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h2l1 2h12l1-2h2M5 10V7a2 2 0 012-2h10a2 2 0 012 2v3M9 21v-6m6 6v-6M9 15h6" />
+                  </svg>הורד קבצים ZIP</>
+              }
+            </button>
+            {/* Excel */}
+            <a href={`/api/reports/export?start=${start}&end=${end}`}
+              className="text-xs font-bold bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-1.5 rounded-lg hover:bg-emerald-100 transition flex items-center gap-1.5">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
               </svg>
               Excel
             </a>
-            <a
-              href={`/api/reports/pdf?start=${start}&end=${end}`}
-              className="text-xs font-bold bg-blue-50 border border-blue-200 text-blue-700 px-3 py-1.5 rounded-lg hover:bg-blue-100 transition flex items-center gap-1"
-            >
+            {/* PDF */}
+            <a href={`/api/reports/pdf?start=${start}&end=${end}`}
+              className="text-xs font-bold bg-blue-50 border border-blue-200 text-blue-700 px-3 py-1.5 rounded-lg hover:bg-blue-100 transition flex items-center gap-1.5">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
               </svg>
@@ -222,7 +217,7 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {invoices.map((inv) => (
+                {invoices.map(inv => (
                   <tr key={inv.id} className="hover:bg-indigo-50/30 transition group">
                     <td className="px-6 py-4 text-sm font-medium text-gray-600 whitespace-nowrap">
                       {new Date(inv.date).toLocaleDateString("he-IL")}
@@ -240,20 +235,14 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
                     </td>
                     <td className="px-4 py-4 text-left">
                       <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition">
-                        <button
-                          onClick={() => setEditingInvoice(inv)}
-                          aria-label="ערוך"
-                          className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition"
-                        >
+                        <button onClick={() => setEditingInvoice(inv)} aria-label="ערוך"
+                          className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition">
                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                           </svg>
                         </button>
-                        <button
-                          onClick={() => handleDeleteInvoice(inv.id)}
-                          aria-label="מחק"
-                          className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
-                        >
+                        <button onClick={() => handleDeleteInvoice(inv.id)} aria-label="מחק"
+                          className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition">
                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                           </svg>
@@ -274,10 +263,8 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
           <div className="bg-white rounded-3xl p-8 w-full max-w-md shadow-2xl animate-in zoom-in-95 duration-200">
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-2xl font-bold">עריכת חשבונית</h2>
-              <button
-                onClick={() => setEditingInvoice(null)}
-                className="text-gray-400 hover:text-gray-600 transition p-1"
-              >
+              <button onClick={() => setEditingInvoice(null)}
+                className="text-gray-400 hover:text-gray-600 p-1 transition">
                 <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -286,75 +273,36 @@ export default function Dashboard({ initialInvoices, userName }: DashboardProps)
             <form onSubmit={handleUpdateInvoice} className="space-y-4">
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-1">סכום (₪)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  required
-                  value={editingInvoice.amount}
-                  onChange={(e) =>
-                    setEditingInvoice({ ...editingInvoice, amount: parseFloat(e.target.value) })
-                  }
-                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none text-right"
-                />
+                <input type="number" step="0.01" required value={editingInvoice.amount}
+                  onChange={e => setEditingInvoice({ ...editingInvoice, amount: parseFloat(e.target.value) })}
+                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none text-right" />
               </div>
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-1">קטגוריה</label>
-                <select
-                  value={editingInvoice.expenseType}
-                  onChange={(e) =>
-                    setEditingInvoice({ ...editingInvoice, expenseType: e.target.value })
-                  }
-                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
-                >
+                <select value={editingInvoice.expenseType}
+                  onChange={e => setEditingInvoice({ ...editingInvoice, expenseType: e.target.value })}
+                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none">
                   {categories.length > 0
-                    ? categories.map((c) => (
-                        <option key={c.id} value={c.name}>{c.name}</option>
-                      ))
-                    : (
-                      <>
-                        <option value={editingInvoice.expenseType}>{editingInvoice.expenseType}</option>
-                        <option value="אחר">אחר</option>
-                      </>
-                    )
+                    ? categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)
+                    : <option value={editingInvoice.expenseType}>{editingInvoice.expenseType}</option>
                   }
                 </select>
               </div>
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-1">תאריך</label>
-                <input
-                  type="date"
-                  required
-                  value={new Date(editingInvoice.date).toISOString().split("T")[0]}
-                  onChange={(e) => setEditingInvoice({ ...editingInvoice, date: e.target.value })}
-                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
-                />
+                <input type="date" required value={new Date(editingInvoice.date).toISOString().split("T")[0]}
+                  onChange={e => setEditingInvoice({ ...editingInvoice, date: e.target.value })}
+                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none" />
               </div>
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-1">תיאור</label>
-                <input
-                  type="text"
-                  value={editingInvoice.description ?? ""}
-                  onChange={(e) =>
-                    setEditingInvoice({ ...editingInvoice, description: e.target.value })
-                  }
-                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none"
-                  placeholder="תיאור קצר"
-                />
+                <input type="text" value={editingInvoice.description ?? ""}
+                  onChange={e => setEditingInvoice({ ...editingInvoice, description: e.target.value })}
+                  className="w-full rounded-xl border-gray-200 border p-3 focus:ring-2 focus:ring-indigo-500 outline-none" />
               </div>
               <div className="flex gap-3 pt-2">
-                <button
-                  type="submit"
-                  className="flex-1 bg-indigo-600 text-white p-3 rounded-xl font-bold hover:bg-indigo-700 transition"
-                >
-                  שמור שינויים
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditingInvoice(null)}
-                  className="flex-1 bg-gray-100 text-gray-600 p-3 rounded-xl font-bold hover:bg-gray-200 transition"
-                >
-                  ביטול
-                </button>
+                <button type="submit" className="flex-1 bg-indigo-600 text-white p-3 rounded-xl font-bold hover:bg-indigo-700 transition">שמור</button>
+                <button type="button" onClick={() => setEditingInvoice(null)} className="flex-1 bg-gray-100 text-gray-600 p-3 rounded-xl font-bold hover:bg-gray-200 transition">ביטול</button>
               </div>
             </form>
           </div>
