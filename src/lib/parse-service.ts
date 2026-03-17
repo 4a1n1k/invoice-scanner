@@ -9,44 +9,39 @@ import type { ParsedInvoice } from "./types";
 // ─── Image pre-processing ─────────────────────────────────────────────────────
 /**
  * Normalizes a mobile photo before OCR:
- * 1. Auto-rotates based on EXIF orientation (fixes upside-down/sideways photos)
- * 2. Converts to JPEG if needed (some formats confuse OCR servers)
- * 3. Limits max dimension to 2400px (reduces upload time without losing quality)
- *
- * Returns a new Blob ready to send as "image" to the OCR endpoint.
+ * 1. Auto-rotates based on EXIF orientation (fixes upside-down/sideways phone photos)
+ * 2. Limits max dimension to 2400px (reduces upload time without losing OCR quality)
+ * 3. Converts to JPEG for consistent OCR server handling
  */
-async function normalizeImageForOcr(file: File): Promise<Blob> {
+async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
+  const originalName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
   try {
-    // sharp is available server-side only — lazy import to avoid edge-runtime issues
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require("sharp");
-    const arrayBuffer = await file.arrayBuffer();
-    const inputBuffer = Buffer.from(arrayBuffer);
+    const inputBuffer = Buffer.from(await file.arrayBuffer());
 
     const outputBuffer: Buffer = await sharp(inputBuffer)
-      .rotate()                          // auto-rotate from EXIF — critical for mobile photos
+      .rotate()                    // auto-rotate from EXIF — critical for mobile photos
       .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
       .jpeg({ quality: 90 })
       .toBuffer();
 
-    return new Blob([outputBuffer], { type: "image/jpeg" });
+    // Convert Buffer → Uint8Array to satisfy Blob constructor type
+    const uint8 = new Uint8Array(outputBuffer.buffer, outputBuffer.byteOffset, outputBuffer.byteLength);
+    return { blob: new Blob([uint8], { type: "image/jpeg" }), filename: originalName };
   } catch {
-    // If sharp fails (e.g., unsupported format), fall back to the original file
     console.warn("[OCR] sharp preprocessing failed, using original file");
-    return file;
+    return { blob: file, filename: file.name };
   }
 }
 
 // ─── OCR ─────────────────────────────────────────────────────────────────────
 
 export async function extractTextViaOcr(file: File): Promise<string> {
-  // Normalize image (fix EXIF rotation from mobile cameras)
-  const processedBlob = await normalizeImageForOcr(file);
+  const { blob, filename } = await normalizeImageForOcr(file);
 
   const formData = new FormData();
-  // Use processed blob with a safe filename
-  const fileName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
-  formData.append("image", processedBlob, fileName);
+  formData.append("image", blob, filename);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
@@ -77,21 +72,14 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 }
 
 // ─── Text pre-processing ──────────────────────────────────────────────────────
-/**
- * Cleans raw OCR/PDF text before sending to the LLM.
- */
+
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-
-  // Remove thousands-separator commas inside numbers: 1,769.94 → 1769.94
+  // Remove thousands-separator commas: 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
-
-  // Also handle: ₪1,769 or NIS 1,769
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
-
-  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026
+  // Normalize dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
-
   return text;
 }
 
@@ -112,21 +100,19 @@ EXTRACTION RULES:
    - CRITICAL: Numbers may appear as "1769.94" or "1,769.94" — strip ALL commas, return only digits and decimal point
    - Return as plain number: 1769.94 (NOT "1,769.94", NOT "₪1769")
    - If VAT (מע"מ) is listed separately, the total already includes it
-   - If you see "1769.94" anywhere near סה"כ or Total, that IS the amount
 
 2. DATE (YYYY-MM-DD):
    - Look for: תאריך, Date, שולם ב
-   - Formats you may see: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
-   - Convert DD/MM/YYYY → YYYY-MM-DD (example: 26/02/2026 → 2026-02-26)
+   - Formats: DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
+   - Convert DD/MM/YYYY → YYYY-MM-DD (example: 15/03/2026 → 2026-03-15)
    - Fallback: today = ${today}
 
 3. TYPE — must be exactly one of: [${catList}]
-   - Match by content: electricity/חשמל/חברת חשמל → utility/בריאות/אחר
-   - Supermarket/מכולת → food category
+   - Match by content: electricity/חשמל → utility; supermarket/מכולת → food
    - Never invent a new category
 
 4. DESCRIPTION (Hebrew, 3-6 words):
-   - Describe what was paid, e.g.: "חשבון חשמל פברואר", "קניות סופרמרקט", "נעליים לילד"
+   - e.g.: "קניות סופרמרקט", "חשבון חשמל פברואר", "נעליים לילד"
 
 OUTPUT — return ONLY this JSON, no other text:
 {"amount": <number>, "date": "<YYYY-MM-DD>", "type": "<category>", "description": "<hebrew description>"}
@@ -180,16 +166,14 @@ export async function parseInvoiceWithLlm(
 
     let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
 
-    // Post-process: sanitize amount if LLM returned it as string
+    // Sanitize amount if returned as string
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
     if (!result.amount || isNaN(result.amount)) {
       const amountMatch = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
                           prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
-      if (amountMatch) {
-        result.amount = parseFloat(amountMatch[1].replace(/,/g, ""));
-      }
+      if (amountMatch) result.amount = parseFloat(amountMatch[1].replace(/,/g, ""));
     }
 
     return { result, payload };
@@ -207,13 +191,9 @@ export interface PipelineResult {
   llmPayload: LlmPayload;
 }
 
-export async function runParsingPipeline(
-  file: File,
-  categories: string[]
-): Promise<PipelineResult> {
+export async function runParsingPipeline(file: File, categories: string[]): Promise<PipelineResult> {
   const ocrText = await extractTextViaOcr(file);
   const prompt = buildParsePrompt(ocrText, categories);
   const { result: parsedInvoice, payload: llmPayload } = await parseInvoiceWithLlm(prompt);
-
   return { parsedInvoice, ocrText, prompt, llmPayload };
 }
