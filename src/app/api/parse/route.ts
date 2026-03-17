@@ -7,11 +7,9 @@ import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { DEFAULT_CATEGORIES } from "@/lib/config";
 import { buildParsePrompt, parseInvoiceWithLlm, runParsingPipeline } from "@/lib/parse-service";
-import type { ParsedInvoice } from "@/lib/types";
 
 export const maxDuration = 60;
 
-// Use a looser return type to avoid LlmPayload incompatibility
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const session = await auth();
   if (!session?.user?.id) {
@@ -20,7 +18,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   const formData = await req.formData();
   const file = formData.get("file") as File | null;
-
   if (!file) {
     return NextResponse.json({ error: "No file provided" }, { status: 400 });
   }
@@ -46,7 +43,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
       if (!ocrText.trim() || ocrText.trim().length < 20) {
         return NextResponse.json(
-          { error: "No text found in PDF. If this is a scanned image, please upload it as JPG or PNG instead." },
+          { error: "No text found in PDF. Please upload as JPG or PNG instead." },
           { status: 400 }
         );
       }
@@ -55,11 +52,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const { result: parsedInvoice, payload: llmPayload } = await parseInvoiceWithLlm(prompt);
 
       return NextResponse.json({
-        data: parsedInvoice as ParsedInvoice,
+        data: parsedInvoice,
         ocrText,
         debug: {
           prompt,
-          llmPayload: llmPayload as Record<string, unknown>,
+          llmPayload: llmPayload as unknown as Record<string, unknown>,
           ocrResponse: ocrText.substring(0, 500) + "…",
         },
       });
@@ -67,11 +64,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const { parsedInvoice, ocrText, prompt, llmPayload } = await runParsingPipeline(file, categories);
 
       return NextResponse.json({
-        data: parsedInvoice as ParsedInvoice,
+        data: parsedInvoice,
         ocrText,
         debug: {
           prompt,
-          llmPayload: llmPayload as Record<string, unknown>,
+          llmPayload: llmPayload as unknown as Record<string, unknown>,
           ocrResponse: ocrText.substring(0, 500) + "…",
         },
       });
