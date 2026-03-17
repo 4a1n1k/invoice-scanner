@@ -6,6 +6,8 @@ import bcrypt from "bcryptjs"
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   adapter: PrismaAdapter(prisma),
+  // trustHost allows NextAuth v5 to accept requests from any host (needed for Docker/IP deployments)
+  trustHost: true,
   providers: [
     Credentials({
       name: "credentials",
@@ -49,6 +51,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     },
   },
   pages: {
-    signIn: '/login', // Redirect default NextAuth login to our custom login page
+    signIn: '/login',
   }
 })
