@@ -113,13 +113,104 @@ export function extractBusinessName(ocrText: string): string {
   return top[0] ?? "לא ידוע";
 }
 
+// ─── Smart Invoice Context Extraction ────────────────────────────────────────
+/**
+ * Extracts the most relevant portion of a long invoice text for LLM parsing.
+ *
+ * Problem: Invoices like KSP have 14,000+ chars — mostly legal boilerplate at the end.
+ * The actual total is always in the first ~30% of the document.
+ * Sending all 14,000 chars wastes LLM tokens and time.
+ *
+ * Strategy — HEAD + TOTAL_WINDOW:
+ * 1. Always include HEAD (first 400 chars) — business name, date, invoice number
+ * 2. Search for total keywords in expanding windows: 25% → 50% → 75% → 100%
+ * 3. When found, extract a 300-char window around the keyword
+ * 4. Final prompt = HEAD + "..." + TOTAL_WINDOW (never more than ~800 chars total)
+ *
+ * For short texts (<= 1500 chars), just use the full text — no extraction needed.
+ */
+
+// Keywords that indicate the total payment amount
+const TOTAL_KEYWORDS = [
+  'סה"כ לתשלום',
+  'לתשלום',
+  'סה"כ כניה',
+  'Grand Total',
+  'Total:',
+  'שולם / זוכה',
+  'סכום כולל',
+  'סה"כ קנייה',
+];
+
+// Lines/sections to exclude from the total window (legal boilerplate)
+const BOILERPLATE_PATTERNS = [
+  /תנאי אחריות/,
+  /תעודת אחריות/,
+  /ביטול עסקה/,
+  /הגנת הצרכן/,
+  /הגבלת אחריות/,
+  /מקרים בהם לא תחול/,
+];
+
+function findTotalPosition(text: string): number {
+  // Search in expanding windows: 25% → 50% → 75% → 100% of text
+  const slices = [0.25, 0.50, 0.75, 1.0];
+
+  for (const fraction of slices) {
+    const searchEnd = Math.floor(text.length * fraction);
+    const searchSlice = text.slice(0, searchEnd);
+
+    for (const keyword of TOTAL_KEYWORDS) {
+      const pos = searchSlice.indexOf(keyword);
+      if (pos !== -1) {
+        // Verify this position is not inside boilerplate
+        const surrounding = text.slice(Math.max(0, pos - 200), pos + 200);
+        const isBoilerplate = BOILERPLATE_PATTERNS.some(p => p.test(surrounding));
+        if (!isBoilerplate) {
+          return pos;
+        }
+      }
+    }
+  }
+
+  return -1; // not found
+}
+
+export function extractInvoiceContext(fullText: string): string {
+  // Short texts — use as-is, no extraction needed
+  if (fullText.length <= 1500) return fullText;
+
+  const HEAD_SIZE = 400;
+  const WINDOW_SIZE = 350; // chars around the total keyword
+
+  const head = fullText.slice(0, HEAD_SIZE);
+  const totalPos = findTotalPosition(fullText);
+
+  if (totalPos === -1) {
+    // No total found — fallback: send HEAD + first 1100 chars
+    console.log("[parse] No total keyword found, using HEAD + beginning");
+    return fullText.slice(0, 1500);
+  }
+
+  // Extract window around the total
+  const windowStart = Math.max(HEAD_SIZE, totalPos - 50);
+  const windowEnd = Math.min(fullText.length, totalPos + WINDOW_SIZE);
+  const totalWindow = fullText.slice(windowStart, windowEnd);
+
+  const result = `${head}\n...\n${totalWindow}`;
+  console.log(`[parse] Smart extraction: ${fullText.length} → ${result.length} chars (total at pos ${totalPos}/${fullText.length})`);
+  return result;
+}
+
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
 
 export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
   const ocrText = preprocessOcrText(rawOcrText);
-  const truncated = ocrText.substring(0, 1500);
   const today = new Date().toISOString().split("T")[0];
   const businessName = extractBusinessName(ocrText);
+
+  // Smart extraction: HEAD + total window instead of naive 1500-char truncation
+  const relevantText = extractInvoiceContext(ocrText);
 
   const catLines = categories
     .map(name => `"${name}"${getCategoryHint(name) ? ` (${getCategoryHint(name)})` : ""}`)
@@ -131,7 +222,7 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
 
 חוקים:
 - amount: הסכום הסופי לתשלום, כמספר בלבד, ללא ₪:
-  * חפש בסדר עדיפות: "סה"כ לתשלום" > "לתשלום" > "סה"כ כניה" > "סה"כ" > "Total"
+  * חפש בסדר עדיפות: "סה"כ לתשלום" > "לתשלום" > "סה"כ קנייה" > "Grand Total" > "סה"כ"
   * אם יש כמה שורות סה"כ — קח את הגדול (הוא כולל מע"מ)
   * אל תיקח: מע"מ בנפרד, "סה"כ ללא מע"מ", מחיר ליחידה
   * "248.7" → 248.7 | "167.00" → 167
@@ -143,7 +234,7 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
 {"amount":<number>,"date":"<YYYY-MM-DD>","type":"<category>","description":"<text>"}
 
 טקסט:
-${truncated}`;
+${relevantText}`;
 }
 
 function getCategoryHint(categoryName: string): string | null {
