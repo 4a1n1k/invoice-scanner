@@ -60,26 +60,68 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 }
 
 // ─── Text pre-processing ──────────────────────────────────────────────────────
-
+/**
+ * Normalizes numbers and dates in OCR text before sending to LLM.
+ *
+ * COMMA HANDLING — two cases, opposite treatment:
+ *   1. Thousands separator (English): 1,769.94 → 1769.94  (comma between digit and 3-digit group, followed by decimal point)
+ *   2. Decimal separator (Hebrew/Israeli): 310,50 → 310.50  (comma between digits where right side is exactly 2 digits with no decimal)
+ *
+ * Rule: if comma is followed by exactly 2 digits (no more) → decimal separator → replace with dot
+ *       if comma is followed by exactly 3 digits → thousands separator → remove comma
+ */
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-  text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
-  text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
+
+  // Case 1: thousands separator — digit,3digits (optionally followed by decimal dot)
+  // e.g. 1,769.94 → 1769.94 | 1,000 → 1000
+  // Only remove if the 3 digits are followed by a dot or non-digit (ensures it's really thousands)
+  text = text.replace(/(\d),(\d{3})(?=\.\d|\D|$)/g, "$1$2");
+
+  // Case 2: Israeli decimal comma — digit,2digits (NOT followed by more digits)
+  // e.g. 310,50 → 310.50 | 47,00 → 47.00
+  text = text.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
+
+  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026
+  // (only when pattern is clearly a date: 1-2 digits . 2 digits . 4 digits)
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
+
   return text;
 }
 
 // ─── Business name extraction ─────────────────────────────────────────────────
+/**
+ * Extracts business name from OCR text.
+ *
+ * Strategy:
+ * 1. בע"מ / Ltd line in the first 8 lines → official registered name
+ * 2. Explicit label (שם העסק:) in first 8 lines
+ * 3. First line with meaningful Hebrew/Latin text (not numbers/symbols)
+ * 4. Domain/email at the end (e.g. hermitage.co.il → Hermitage)
+ *
+ * Also SKIPS known PDF header noise like "מסמך ממוחשב", "Page 1 of 1", "www.weezmo.com"
+ */
+const NOISE_PATTERNS = [
+  /מסמך ממוחשב/,
+  /מסמך זה הינו/,
+  /page \d+ of \d+/i,
+  /weezmo/i,
+  /verified by/i,
+  /חתימה אלקטרונית/,
+  /הוראות ניהול ספרים/,
+];
 
 export function extractBusinessName(ocrText: string): string {
   const lines = ocrText
     .split("\n")
     .map(l => l.trim())
-    .filter(l => l.length > 1);
+    .filter(l => l.length > 1)
+    // Filter out known PDF metadata/header noise
+    .filter(l => !NOISE_PATTERNS.some(p => p.test(l)));
 
-  const top = lines.slice(0, 8);
+  const top = lines.slice(0, 10);
 
-  // Priority 1: line with בע"מ / Ltd
+  // Priority 1: line with בע"מ / Ltd in first 10 lines
   const companyLine = top.find(l => /בע[""']מ|בע"מ|בעמ|ltd\.?|llc\.?|inc\.?/i.test(l));
   if (companyLine) return companyLine.replace(/\d{2,}-\d{4,}/g, "").trim();
 
@@ -87,15 +129,19 @@ export function extractBusinessName(ocrText: string): string {
   const labelLine = top.find(l => /^(שם העסק|עסק|מסעדה|חנות|סניף|name)\s*[:\-]/i.test(l));
   if (labelLine) return labelLine.replace(/^[^:\-]+[:\-]\s*/, "").trim();
 
-  // Priority 3: first line with enough Hebrew/Latin text
+  // Priority 3: first line with enough Hebrew/Latin text (not mostly numbers/symbols)
   const textLine = top.find(l => {
     const hebrewOrLatin = l.replace(/[^א-תa-z\s]/gi, "").trim();
     return hebrewOrLatin.length >= 3 && hebrewOrLatin.length >= l.length * 0.4;
   });
   if (textLine) return textLine.trim();
 
-  // Priority 4: try to extract from domain/email at the end (e.g. pairzon.com → Pairzon)
-  const domainLine = lines.slice(-5).find(l => /www\.|\.co\.il|\.com/i.test(l));
+  // Priority 4: extract from domain/email at the END of the document
+  const allLines = lines;
+  const domainLine = allLines.slice(-10).find(l =>
+    /www\.|\.co\.il|\.com/i.test(l) &&
+    !/weezmo|info@weezmo/.test(l) // skip known non-business domains
+  );
   if (domainLine) {
     const match = domainLine.match(/(?:www\.)?([a-z0-9\-]+)(?:\.co\.il|\.com)/i);
     if (match) return match[1].charAt(0).toUpperCase() + match[1].slice(1);
@@ -121,9 +167,9 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
 קטגוריות: ${catLines}
 
 חוקים:
-- amount: סה"כ לתשלום כמספר בלבד (ללא פסיקים, ללא ₪). "310,50"→310.50
-- date: DD/MM/YYYY→YYYY-MM-DD. אחרת: ${today}
-- type: בחר בדיוק אחת מהקטגוריות לפי שם העסק והפריטים
+- amount: סה"כ לתשלום כמספר בלבד. ללא פסיקים, ללא ₪. "308.12" → 308.12
+- date: DD/MM/YYYY → YYYY-MM-DD. "13/03/2026" → "2026-03-13". אחרת: ${today}
+- type: בחר קטגוריה לפי שם העסק והפריטים
 - description: "[שם עסק] — [מה נרכש]" בעברית, 3-5 מילים
 
 החזר JSON בלבד:
@@ -146,53 +192,31 @@ function getCategoryHint(categoryName: string): string | null {
 }
 
 // ─── JSON repair ──────────────────────────────────────────────────────────────
-/**
- * Tries to extract a valid ParsedInvoice from potentially truncated LLM output.
- *
- * Handles two cases:
- * 1. Complete JSON: {"amount":308.12,"date":"2026-03-13","type":"מזון","description":"Hermitage"}
- * 2. Truncated JSON (num_predict cut it short): {"amount":308.12,"date":"2026-03-13","type":"תשתיות","description":"א.ח הרמיטאז
- *    → we close the open string + object and parse field by field
- */
 function repairAndParseJson(raw: string): ParsedInvoice | null {
-  // First try: standard full JSON
+  // First try: complete JSON
   const fullMatch = raw.match(/\{[\s\S]*\}/);
   if (fullMatch) {
-    try {
-      return JSON.parse(fullMatch[0]);
-    } catch {
-      // fall through to repair
-    }
+    try { return JSON.parse(fullMatch[0]); } catch { /* fall through */ }
   }
 
-  // Second try: the JSON was truncated — close open string/object and try again
+  // Second try: truncated JSON — close open string + object
   let partial = raw;
-  // Find the opening brace
   const start = partial.indexOf("{");
   if (start === -1) return null;
   partial = partial.slice(start);
-
-  // Close any unclosed string
   const quoteCount = (partial.match(/(?<!\\)"/g) ?? []).length;
   if (quoteCount % 2 !== 0) partial += '"';
-
-  // Close the object
   if (!partial.trimEnd().endsWith("}")) partial += "}";
-
   try {
     const obj = JSON.parse(partial);
-    // Validate it has at least amount or date
     if (obj.amount !== undefined || obj.date !== undefined) return obj;
-  } catch {
-    // fall through to field-by-field extraction
-  }
+  } catch { /* fall through */ }
 
-  // Third try: extract fields with regex fallback
+  // Third try: regex field extraction
   const amount = raw.match(/"amount"\s*:\s*([\d.]+)/)?.[1];
   const date = raw.match(/"date"\s*:\s*"([^"]+)"/)?.[1];
   const type = raw.match(/"type"\s*:\s*"([^"]+)"/)?.[1];
   const description = raw.match(/"description"\s*:\s*"([^"]+)"/)?.[1];
-
   if (amount || date) {
     return {
       amount: parseFloat(amount ?? "0"),
@@ -201,7 +225,6 @@ function repairAndParseJson(raw: string): ParsedInvoice | null {
       description: description ?? "",
     };
   }
-
   return null;
 }
 
@@ -212,10 +235,7 @@ interface LlmPayload {
   prompt: string;
   stream: false;
   format: "json";
-  options: {
-    temperature: number;
-    num_predict: number;
-  };
+  options: { temperature: number; num_predict: number };
 }
 
 export async function parseInvoiceWithLlm(
@@ -226,10 +246,7 @@ export async function parseInvoiceWithLlm(
     prompt,
     stream: false,
     format: "json",
-    options: {
-      temperature: 0,
-      num_predict: 200, // raised from 120 → prevents truncation of Hebrew descriptions
-    },
+    options: { temperature: 0, num_predict: 200 },
   };
 
   const controller = new AbortController();
@@ -247,21 +264,17 @@ export async function parseInvoiceWithLlm(
     }
     const llmData = await res.json();
     const rawText: string = llmData.response?.trim() ?? "";
-
-    // Use repairAndParseJson instead of simple regex — handles truncated output
     let result = repairAndParseJson(rawText);
-    if (!result) {
-      throw new Error(`LLM returned no parseable JSON. Raw: ${rawText.slice(0, 200)}`);
-    }
+    if (!result) throw new Error(`LLM returned no parseable JSON. Raw: ${rawText.slice(0, 200)}`);
 
     // Sanitize amount
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
     if (!result.amount || isNaN(result.amount)) {
-      const m = rawText.match(/"amount"\s*:\s*"?([\d,]+\.?\d*)/) ??
-                prompt.match(/סה"כ[^\d]*([\d,]+\.?\d*)/);
-      if (m) result.amount = parseFloat(m[1].replace(/,/g, ""));
+      const m = rawText.match(/"amount"\s*:\s*"?([\d.]+)/) ??
+                prompt.match(/סה"כ[^\d]*([\d.]+)/);
+      if (m) result.amount = parseFloat(m[1]);
     }
 
     return { result, payload };
