@@ -17,7 +17,13 @@ RUN npm run build
 
 # ─── Stage 3: Production runner ───────────────────────────────────────────────
 FROM node:20-alpine AS runner
-RUN apk add --no-cache openssl
+
+# openssl — Prisma engine
+# ghostscript + graphicsmagick — pdf2pic PDF→image conversion (fallback for garbled PDFs)
+RUN apk add --no-cache \
+    openssl \
+    ghostscript \
+    graphicsmagick
 
 WORKDIR /app
 
@@ -40,6 +46,8 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules/prisma   ./node_modu
 # Dynamic-require packages not bundled by Next.js standalone
 COPY --from=builder /app/node_modules/pdf-parse  ./node_modules/pdf-parse
 COPY --from=builder /app/node_modules/adm-zip    ./node_modules/adm-zip
+COPY --from=builder /app/node_modules/pdf2pic    ./node_modules/pdf2pic
+COPY --from=builder /app/node_modules/gm         ./node_modules/gm
 
 # Next.js standalone bundle
 COPY --from=builder /app/public                                        ./public
