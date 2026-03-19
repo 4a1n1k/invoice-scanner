@@ -2,9 +2,9 @@
  * POST /api/parse
  *
  * PDF handling strategy:
- *   1. Try pdf-parse to extract embedded text
- *   2. Validate the text quality (garbled/encoded PDFs fail the check)
- *   3. If quality fails → convert PDF page to image → send to OCR (same as image pipeline)
+ *   1. Extract embedded text via pdf-parse
+ *   2. Check BOTH quality AND content length — weezmo/image PDFs pass quality but have no invoice content
+ *   3. If text is too short OR garbled → convert page to image → OCR
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -18,42 +18,74 @@ export const maxDuration = 60;
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /**
- * Returns a quality score 0-1 for extracted PDF text.
- * Low score = garbled / custom-encoded font → need OCR fallback.
+ * Decides whether extracted PDF text is usable for invoice parsing.
  *
- * Checks:
- * - Ratio of printable ASCII + Hebrew chars to total chars
- * - If >30% chars are in Private Use Area (U+E000–U+F8FF) → garbage
+ * Two failure modes we handle:
+ * A) Garbled/encoded text (custom font): high PUA character ratio → quality < 0.6
+ * B) Image-based PDF (e.g. weezmo): text exists but it's only metadata/footer,
+ *    not the actual invoice — detected by short meaningful content length
+ *
+ * "Meaningful" = lines that look like invoice content (numbers, amounts, dates, items)
+ * NOT just "מסמך ממוחשב", "Page 1 of 1", "www.weezmo.com" footer lines
  */
-function pdfTextQuality(text: string): number {
-  if (!text || text.length === 0) return 0;
-  let good = 0;
+const PDF_NOISE_LINES = [
+  /מסמך ממוחשב/,
+  /מסמך זה הינו/,
+  /page \d+ of \d+/i,
+  /weezmo/i,
+  /info@weezmo/i,
+  /חתימה אלקטרונית/,
+  /הוראות ניהול ספרים/,
+  /verified by/i,
+];
+
+function isPdfTextUsable(text: string): boolean {
+  if (!text || text.length === 0) return false;
+
+  // Check 1: PUA (Private Use Area) ratio — garbled custom fonts
   let pua = 0;
+  let total = 0;
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0;
-    const isHebrew = cp >= 0x05d0 && cp <= 0x05ea;
-    const isLatin = cp >= 0x20 && cp <= 0x7e;
-    const isCommon = cp === 0x0a || cp === 0x0d || cp === 0x09; // newline/tab
     const isPUA = cp >= 0xe000 && cp <= 0xf8ff;
-    if (isHebrew || isLatin || isCommon) good++;
     if (isPUA) pua++;
+    total++;
   }
-  const total = text.length;
-  if (pua / total > 0.15) return 0; // >15% PUA = definitely garbled
-  return good / total;
+  if (total > 0 && pua / total > 0.15) {
+    console.log(`[parse] PDF rejected: ${(pua/total*100).toFixed(0)}% PUA chars (garbled font)`);
+    return false;
+  }
+
+  // Check 2: meaningful content length
+  // Strip known noise lines and see what's left
+  const meaningfulLines = text
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 2)
+    .filter(l => !PDF_NOISE_LINES.some(p => p.test(l)));
+
+  const meaningfulText = meaningfulLines.join("\n");
+
+  // Need at least 100 chars of actual invoice content
+  // (a real invoice has amounts, dates, items — way more than 100 chars)
+  if (meaningfulText.length < 100) {
+    console.log(`[parse] PDF rejected: only ${meaningfulText.length} meaningful chars (image-based PDF)`);
+    return false;
+  }
+
+  return true;
 }
 
 /**
- * Converts the first page of a PDF buffer to a JPEG image buffer
- * using pdf2pic (which wraps GraphicsMagick/Ghostscript).
- * Returns null if conversion fails.
+ * Converts the first page of a PDF buffer to a JPEG image blob
+ * using pdf2pic (wraps Ghostscript/GraphicsMagick).
  */
 async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { fromBuffer } = require("pdf2pic");
     const convert = fromBuffer(pdfBuffer, {
-      density: 200,        // DPI — enough for OCR accuracy
+      density: 200,
       format: "jpeg",
       width: 1800,
       height: 2600,
@@ -101,17 +133,15 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (file.type === "application/pdf") {
       const pdfBuffer = Buffer.from(await file.arrayBuffer());
 
-      // Step 1: try embedded text extraction
+      // Step 1: try embedded text
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pdfParse = require("pdf-parse/lib/pdf-parse.js");
       const pdfData = await pdfParse(pdfBuffer);
       const rawText: string = pdfData.text ?? "";
-      const quality = pdfTextQuality(rawText);
 
-      console.log(`[parse] PDF text quality: ${(quality * 100).toFixed(0)}% (${rawText.length} chars)`);
-
-      if (quality >= 0.6 && rawText.trim().length >= 20) {
-        // Good quality text — use it directly (fast path, no OCR needed)
+      if (isPdfTextUsable(rawText)) {
+        // Good embedded text — use directly (fast, no OCR needed)
+        console.log("[parse] PDF: using embedded text");
         const prompt = buildParsePrompt(rawText, categories);
         const { result: parsedInvoice, payload: llmPayload } = await parseInvoiceWithLlm(prompt);
         return NextResponse.json({
@@ -126,15 +156,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         });
       }
 
-      // Step 2: garbled/encoded PDF → convert to image → OCR (same as photo)
-      console.log("[parse] PDF text quality too low, falling back to image OCR");
+      // Step 2: fallback — convert PDF page to image → OCR
+      console.log("[parse] PDF: falling back to image OCR");
       const imageBlob = await pdfPageToImageBlob(pdfBuffer);
 
       if (imageBlob) {
         const imageFile = new File([imageBlob], "pdf_page.jpg", { type: "image/jpeg" });
         const { parsedInvoice, ocrText, prompt, llmPayload } = await runParsingPipeline(
-          imageFile,
-          categories
+          imageFile, categories
         );
         return NextResponse.json({
           data: parsedInvoice,
@@ -150,19 +179,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
       // Step 3: both failed
       return NextResponse.json(
-        {
-          error:
-            "לא ניתן לחלץ טקסט מה-PDF. נסה להמיר לתמונה (JPG/PNG) ולהעלות שוב.",
-        },
+        { error: "לא ניתן לחלץ טקסט מה-PDF. נסה להמיר לתמונה (JPG/PNG) ולהעלות שוב." },
         { status: 400 }
       );
     }
 
     // ── Image path ─────────────────────────────────────────────────────────────
-    const { parsedInvoice, ocrText, prompt, llmPayload } = await runParsingPipeline(
-      file,
-      categories
-    );
+    const { parsedInvoice, ocrText, prompt, llmPayload } = await runParsingPipeline(file, categories);
     return NextResponse.json({
       data: parsedInvoice,
       ocrText,
@@ -172,6 +195,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         ocrResponse: ocrText.substring(0, 500) + "…",
       },
     });
+
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[parse] Pipeline error:", message);
