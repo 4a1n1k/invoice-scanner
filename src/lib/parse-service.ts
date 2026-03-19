@@ -14,9 +14,11 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
     const sharp = require("sharp");
     const inputBuffer = Buffer.from(await file.arrayBuffer());
     const outputBuffer: Buffer = await sharp(inputBuffer)
-      .rotate()
+      .rotate()                      // fix EXIF rotation — critical for mobile photos
       .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
-      .jpeg({ quality: 90 })
+      .sharpen({ sigma: 1.2 })       // sharpen text edges — helps Tesseract on blurry phone photos
+      .normalize()                   // auto contrast stretch — fixes uneven lighting on receipts
+      .jpeg({ quality: 92 })         // higher quality → less JPEG blocking on small text
       .toBuffer();
     const plainArrayBuffer = outputBuffer.buffer.slice(
       outputBuffer.byteOffset,
@@ -64,11 +66,8 @@ export async function extractTextViaOcr(file: File): Promise<{ text: string; ms:
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-  // Thousands separator (English): 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=\.\d|\D|$)/g, "$1$2");
-  // Decimal comma (Israeli): 310,50 → 310.50
   text = text.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
-  // Dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }
@@ -114,17 +113,6 @@ export function extractBusinessName(ocrText: string): string {
 }
 
 // ─── Smart Invoice Context Extraction ────────────────────────────────────────
-/**
- * Extracts the most relevant portion of a long invoice text for LLM parsing.
- *
- * Strategy — HEAD + TOTAL_WINDOW:
- * 1. Always include HEAD (first 400 chars) — business name, date, invoice number
- * 2. Search for total keywords in expanding windows: 25% → 50% → 75% → 100%
- * 3. When found, extract a 300-char window around the keyword
- * 4. Final prompt = HEAD + "..." + TOTAL_WINDOW (never more than ~800 chars total)
- *
- * For short texts (<= 1500 chars), just use the full text.
- */
 
 const TOTAL_KEYWORDS = [
   'סה"כ לתשלום',
@@ -138,12 +126,8 @@ const TOTAL_KEYWORDS = [
 ];
 
 const BOILERPLATE_PATTERNS = [
-  /תנאי אחריות/,
-  /תעודת אחריות/,
-  /ביטול עסקה/,
-  /הגנת הצרכן/,
-  /הגבלת אחריות/,
-  /מקרים בהם לא תחול/,
+  /תנאי אחריות/, /תעודת אחריות/, /ביטול עסקה/,
+  /הגנת הצרכן/, /הגבלת אחריות/, /מקרים בהם לא תחול/,
 ];
 
 function findTotalPosition(text: string): number {
@@ -168,7 +152,6 @@ export function extractInvoiceContext(fullText: string): string {
 
   const HEAD_SIZE = 400;
   const WINDOW_SIZE = 350;
-
   const head = fullText.slice(0, HEAD_SIZE);
   const totalPos = findTotalPosition(fullText);
 
@@ -180,7 +163,6 @@ export function extractInvoiceContext(fullText: string): string {
   const windowStart = Math.max(HEAD_SIZE, totalPos - 50);
   const windowEnd = Math.min(fullText.length, totalPos + WINDOW_SIZE);
   const totalWindow = fullText.slice(windowStart, windowEnd);
-
   const result = `${head}\n...\n${totalWindow}`;
   console.log(`[parse] Smart extraction: ${fullText.length} → ${result.length} chars (total at pos ${totalPos}/${fullText.length})`);
   return result;
