@@ -63,19 +63,14 @@ export async function extractTextViaOcr(file: File): Promise<string> {
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-  // Remove thousands-separator commas: 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=[.\s,\n]|$)/g, "$1$2");
   text = text.replace(/([\u20aa$])\s*(\d+),(\d{3})/g, "$1$2$3");
-  // Normalize dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }
 
-// ─── Business name extraction (server-side, before LLM) ──────────────────────
-/**
- * Extracts business name from the FIRST few lines of OCR text.
- * Priority: בע"מ line → label prefix → first meaningful text line
- */
+// ─── Business name extraction ─────────────────────────────────────────────────
+
 export function extractBusinessName(ocrText: string): string {
   const lines = ocrText
     .split("\n")
@@ -84,43 +79,39 @@ export function extractBusinessName(ocrText: string): string {
 
   const top = lines.slice(0, 8);
 
+  // Priority 1: line with בע"מ / Ltd
   const companyLine = top.find(l => /בע[""']מ|בע"מ|בעמ|ltd\.?|llc\.?|inc\.?/i.test(l));
   if (companyLine) return companyLine.replace(/\d{2,}-\d{4,}/g, "").trim();
 
+  // Priority 2: explicit label prefix
   const labelLine = top.find(l => /^(שם העסק|עסק|מסעדה|חנות|סניף|name)\s*[:\-]/i.test(l));
   if (labelLine) return labelLine.replace(/^[^:\-]+[:\-]\s*/, "").trim();
 
+  // Priority 3: first line with enough Hebrew/Latin text
   const textLine = top.find(l => {
     const hebrewOrLatin = l.replace(/[^א-תa-z\s]/gi, "").trim();
     return hebrewOrLatin.length >= 3 && hebrewOrLatin.length >= l.length * 0.4;
   });
   if (textLine) return textLine.trim();
 
+  // Priority 4: try to extract from domain/email at the end (e.g. pairzon.com → Pairzon)
+  const domainLine = lines.slice(-5).find(l => /www\.|\.co\.il|\.com/i.test(l));
+  if (domainLine) {
+    const match = domainLine.match(/(?:www\.)?([a-z0-9\-]+)(?:\.co\.il|\.com)/i);
+    if (match) return match[1].charAt(0).toUpperCase() + match[1].slice(1);
+  }
+
   return top[0] ?? "לא ידוע";
 }
 
 // ─── LLM Prompt ──────────────────────────────────────────────────────────────
-/**
- * Optimized prompt — ~350 tokens instead of ~800.
- *
- * Key optimizations:
- * 1. Business name pre-extracted server-side → no chain-of-thought needed in model
- * 2. OCR text truncated to 1500 chars (enough for any receipt)
- * 3. Category list compact — one line per category with short hint
- * 4. Single-sentence rules instead of bullet lists
- * 5. Explicit num_predict limit passed via LLM payload to cap output tokens
- */
+
 export function buildParsePrompt(rawOcrText: string, categories: string[]): string {
   const ocrText = preprocessOcrText(rawOcrText);
-
-  // Truncate to 1500 chars — receipts are short, extra text just costs tokens
   const truncated = ocrText.substring(0, 1500);
   const today = new Date().toISOString().split("T")[0];
-
-  // Pre-extract business name to anchor the model
   const businessName = extractBusinessName(ocrText);
 
-  // Compact category list: "מזון (סופרמרקט, מסעדה)" — one line each
   const catLines = categories
     .map(name => `"${name}"${getCategoryHint(name) ? ` (${getCategoryHint(name)})` : ""}`)
     .join(" | ");
@@ -154,6 +145,66 @@ function getCategoryHint(categoryName: string): string | null {
   return null;
 }
 
+// ─── JSON repair ──────────────────────────────────────────────────────────────
+/**
+ * Tries to extract a valid ParsedInvoice from potentially truncated LLM output.
+ *
+ * Handles two cases:
+ * 1. Complete JSON: {"amount":308.12,"date":"2026-03-13","type":"מזון","description":"Hermitage"}
+ * 2. Truncated JSON (num_predict cut it short): {"amount":308.12,"date":"2026-03-13","type":"תשתיות","description":"א.ח הרמיטאז
+ *    → we close the open string + object and parse field by field
+ */
+function repairAndParseJson(raw: string): ParsedInvoice | null {
+  // First try: standard full JSON
+  const fullMatch = raw.match(/\{[\s\S]*\}/);
+  if (fullMatch) {
+    try {
+      return JSON.parse(fullMatch[0]);
+    } catch {
+      // fall through to repair
+    }
+  }
+
+  // Second try: the JSON was truncated — close open string/object and try again
+  let partial = raw;
+  // Find the opening brace
+  const start = partial.indexOf("{");
+  if (start === -1) return null;
+  partial = partial.slice(start);
+
+  // Close any unclosed string
+  const quoteCount = (partial.match(/(?<!\\)"/g) ?? []).length;
+  if (quoteCount % 2 !== 0) partial += '"';
+
+  // Close the object
+  if (!partial.trimEnd().endsWith("}")) partial += "}";
+
+  try {
+    const obj = JSON.parse(partial);
+    // Validate it has at least amount or date
+    if (obj.amount !== undefined || obj.date !== undefined) return obj;
+  } catch {
+    // fall through to field-by-field extraction
+  }
+
+  // Third try: extract fields with regex fallback
+  const amount = raw.match(/"amount"\s*:\s*([\d.]+)/)?.[1];
+  const date = raw.match(/"date"\s*:\s*"([^"]+)"/)?.[1];
+  const type = raw.match(/"type"\s*:\s*"([^"]+)"/)?.[1];
+  const description = raw.match(/"description"\s*:\s*"([^"]+)"/)?.[1];
+
+  if (amount || date) {
+    return {
+      amount: parseFloat(amount ?? "0"),
+      date: date ?? new Date().toISOString().split("T")[0],
+      type: type ?? "",
+      description: description ?? "",
+    };
+  }
+
+  return null;
+}
+
 // ─── LLM call ─────────────────────────────────────────────────────────────────
 
 interface LlmPayload {
@@ -176,8 +227,8 @@ export async function parseInvoiceWithLlm(
     stream: false,
     format: "json",
     options: {
-      temperature: 0,    // deterministic — no creative guessing
-      num_predict: 120,  // JSON output is ~80-100 tokens, cap at 120
+      temperature: 0,
+      num_predict: 200, // raised from 120 → prevents truncation of Hebrew descriptions
     },
   };
 
@@ -196,9 +247,12 @@ export async function parseInvoiceWithLlm(
     }
     const llmData = await res.json();
     const rawText: string = llmData.response?.trim() ?? "";
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error(`LLM returned no JSON. Raw: ${rawText.slice(0, 200)}`);
-    let result: ParsedInvoice = JSON.parse(jsonMatch[0]);
+
+    // Use repairAndParseJson instead of simple regex — handles truncated output
+    let result = repairAndParseJson(rawText);
+    if (!result) {
+      throw new Error(`LLM returned no parseable JSON. Raw: ${rawText.slice(0, 200)}`);
+    }
 
     // Sanitize amount
     if (typeof result.amount === "string") {
