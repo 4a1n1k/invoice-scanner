@@ -19,32 +19,69 @@ const PDF_NOISE_LINES = [
 ];
 
 function isTextRtlReversed(text: string): boolean {
-  const reversedMarkers = ["בשחוממ ךמסמ", ":קסע םש", ":ךיראת"];
+  const reversedMarkers = ["בשחוממ ךמסמ", ":קסע םש", ":ךיראת", "כ\"הס"];
   return reversedMarkers.some(m => text.includes(m));
 }
 
+/**
+ * Smart RTL reversal:
+ * - Reverses Hebrew text char-by-char (fixes mirrored letters)
+ * - Preserves numbers, amounts, dates in correct order
+ *
+ * Example: '₪ 248.7 :כ"הס' → 'סה"כ: 248.7 ₪'
+ * (naive reversal would give 'סה"כ: 7.842 ₪' — wrong!)
+ */
+function smartReverseRtlLine(line: string): string {
+  // Only reverse lines containing Hebrew characters
+  if (!/[\u05d0-\u05ea]/.test(line)) return line;
+
+  // Step 1: char-reverse the whole line
+  let rev = line.split("").reverse().join("");
+
+  // Step 2: fix numbers that got reversed — reverse digit sequences back
+  // This handles: 248.7, 37.94, 18:56:02, 23/02/2026, 82.9, etc.
+  rev = rev.replace(/\d[\d.:,/]*\d|\d/g, (match) =>
+    match.split("").reverse().join("")
+  );
+
+  return rev;
+}
+
 function fixRtlReversedText(text: string): string {
-  return text.split("\n").map(line => {
-    const trimmed = line.trim();
-    return /[\u05d0-\u05ea]/.test(trimmed) ? trimmed.split("").reverse().join("") : trimmed;
-  }).join("\n");
+  return text
+    .split("\n")
+    .map(line => smartReverseRtlLine(line.trim()))
+    .join("\n");
 }
 
 function isPdfTextUsable(text: string): boolean {
   if (!text || text.length === 0) return false;
+
+  // Check PUA (garbled custom fonts)
   let pua = 0, total = 0;
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0;
     if (cp >= 0xe000 && cp <= 0xf8ff) pua++;
     total++;
   }
-  if (total > 0 && pua / total > 0.15) { console.log(`[parse] PDF rejected: garbled font`); return false; }
+  if (total > 0 && pua / total > 0.15) {
+    console.log(`[parse] PDF rejected: ${(pua / total * 100).toFixed(0)}% PUA chars`);
+    return false;
+  }
 
-  const meaningfulText = text.split("\n")
-    .map(l => l.trim()).filter(l => l.length > 2)
-    .filter(l => !PDF_NOISE_LINES.some(p => p.test(l))).join("\n");
+  // Check meaningful content after noise removal
+  const meaningfulText = text
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 2)
+    .filter(l => !PDF_NOISE_LINES.some(p => p.test(l)))
+    .join("\n");
 
-  if (meaningfulText.length < 100) { console.log(`[parse] PDF rejected: only ${meaningfulText.length} meaningful chars`); return false; }
+  if (meaningfulText.length < 100) {
+    console.log(`[parse] PDF rejected: only ${meaningfulText.length} meaningful chars`);
+    return false;
+  }
+
   return true;
 }
 
@@ -52,13 +89,18 @@ async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { fromBuffer } = require("pdf2pic");
-    const convert = fromBuffer(pdfBuffer, { density: 200, format: "jpeg", width: 1800, height: 2600, preserveAspectRatio: true });
+    const convert = fromBuffer(pdfBuffer, {
+      density: 200, format: "jpeg", width: 1800, height: 2600, preserveAspectRatio: true,
+    });
     const result = await convert(1, { responseType: "buffer" });
     if (!result?.buffer) return null;
     const buf = result.buffer as Buffer;
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     return new Blob([ab as ArrayBuffer], { type: "image/jpeg" });
-  } catch (err) { console.warn("[parse] pdf2pic failed:", err); return null; }
+  } catch (err) {
+    console.warn("[parse] pdf2pic failed:", err);
+    return null;
+  }
 }
 
 // ── Route handler ──────────────────────────────────────────────────────────────
@@ -85,8 +127,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const pdfData = await pdfParse(pdfBuffer);
       let rawText: string = pdfData.text ?? "";
 
+      // Fix RTL-reversed text (weezmo artifact) — smart reversal preserves numbers
       if (isTextRtlReversed(rawText)) {
-        console.log("[parse] PDF: fixing RTL-reversed text");
+        console.log("[parse] PDF: fixing RTL-reversed text (smart)");
         rawText = fixRtlReversedText(rawText);
       }
 
@@ -96,14 +139,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         const prompt = buildParsePrompt(rawText, categories);
         const { result: parsedInvoice, payload: llmPayload, ms: llmMs } = await parseInvoiceWithLlm(prompt);
         return NextResponse.json({
-          data: parsedInvoice,
-          ocrText: rawText,
+          data: parsedInvoice, ocrText: rawText,
           timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
           debug: { pdfPath: "embedded-text", prompt, llmPayload: llmPayload as unknown as Record<string, unknown>, ocrResponse: rawText.substring(0, 500) + "…" },
         });
       }
 
-      // Fallback: convert to image → OCR
+      // Fallback: image OCR
       console.log("[parse] PDF: falling back to image OCR");
       const imageBlob = await pdfPageToImageBlob(pdfBuffer);
       if (imageBlob) {
@@ -115,7 +157,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         });
       }
 
-      return NextResponse.json({ error: "לא ניתן לחלץ טקסט מה-PDF. נסה להמיר לתמונה (JPG/PNG) ולהעלות שוב." }, { status: 400 });
+      return NextResponse.json(
+        { error: "לא ניתן לחלץ טקסט מה-PDF. נסה להמיר לתמונה (JPG/PNG) ולהעלות שוב." },
+        { status: 400 }
+      );
     }
 
     // ── Image ────────────────────────────────────────────────────────────────

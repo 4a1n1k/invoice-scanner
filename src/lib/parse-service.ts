@@ -76,14 +76,9 @@ export function preprocessOcrText(raw: string): string {
 // ─── Business name extraction ─────────────────────────────────────────────────
 
 const NOISE_PATTERNS = [
-  /מסמך ממוחשב/,
-  /מסמך זה הינו/,
-  /page \d+ of \d+/i,
-  /weezmo/i,
-  /info@weezmo/i,
-  /חתימה אלקטרונית/,
-  /הוראות ניהול ספרים/,
-  /verified by/i,
+  /מסמך ממוחשב/, /מסמך זה הינו/, /page \d+ of \d+/i,
+  /weezmo/i, /info@weezmo/i, /חתימה אלקטרונית/,
+  /הוראות ניהול ספרים/, /verified by/i,
 ];
 
 export function extractBusinessName(ocrText: string): string {
@@ -107,8 +102,7 @@ export function extractBusinessName(ocrText: string): string {
   });
   if (textLine) return textLine.trim();
 
-  const allLines = lines;
-  const domainLine = allLines.slice(-10).find(l =>
+  const domainLine = lines.slice(-10).find(l =>
     /www\.|\.co\.il|\.com/i.test(l) && !/weezmo|info@weezmo/.test(l)
   );
   if (domainLine) {
@@ -136,8 +130,12 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
 קטגוריות: ${catLines}
 
 חוקים:
-- amount: סה"כ לתשלום כמספר בלבד. ללא פסיקים, ללא ₪. "308.12" → 308.12
-- date: DD/MM/YYYY → YYYY-MM-DD. "13/03/2026" → "2026-03-13". אחרת: ${today}
+- amount: הסכום הסופי לתשלום, כמספר בלבד, ללא ₪:
+  * חפש בסדר עדיפות: "סה"כ לתשלום" > "לתשלום" > "סה"כ כניה" > "סה"כ" > "Total"
+  * אם יש כמה שורות סה"כ — קח את הגדול (הוא כולל מע"מ)
+  * אל תיקח: מע"מ בנפרד, "סה"כ ללא מע"מ", מחיר ליחידה
+  * "248.7" → 248.7 | "167.00" → 167
+- date: DD/MM/YYYY → YYYY-MM-DD. אחרת: ${today}
 - type: בחר קטגוריה לפי שם העסק והפריטים
 - description: "[שם עסק] — [מה נרכש]" בעברית, 3-5 מילים
 
@@ -267,10 +265,7 @@ export async function runParsingPipeline(file: File, categories: string[]): Prom
   const prompt = buildParsePrompt(ocrText, categories);
   const { result: parsedInvoice, payload: llmPayload, ms: llmMs } = await parseInvoiceWithLlm(prompt);
   return {
-    parsedInvoice,
-    ocrText,
-    prompt,
-    llmPayload,
+    parsedInvoice, ocrText, prompt, llmPayload,
     timings: { ocr: ocrMs, llm: llmMs, total: Date.now() - t0 },
   };
 }
