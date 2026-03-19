@@ -3,8 +3,9 @@
  *
  * PDF handling strategy:
  *   1. Extract embedded text via pdf-parse
- *   2. Check BOTH quality AND content length — weezmo/image PDFs pass quality but have no invoice content
- *   3. If text is too short OR garbled → convert page to image → OCR
+ *   2. Detect RTL-reversed text (weezmo PDFs render Hebrew mirrored) → fix it
+ *   3. Check content usability (length + quality)
+ *   4. If unusable → convert page to image → OCR
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -17,17 +18,6 @@ export const maxDuration = 60;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/**
- * Decides whether extracted PDF text is usable for invoice parsing.
- *
- * Two failure modes we handle:
- * A) Garbled/encoded text (custom font): high PUA character ratio → quality < 0.6
- * B) Image-based PDF (e.g. weezmo): text exists but it's only metadata/footer,
- *    not the actual invoice — detected by short meaningful content length
- *
- * "Meaningful" = lines that look like invoice content (numbers, amounts, dates, items)
- * NOT just "מסמך ממוחשב", "Page 1 of 1", "www.weezmo.com" footer lines
- */
 const PDF_NOISE_LINES = [
   /מסמך ממוחשב/,
   /מסמך זה הינו/,
@@ -39,25 +29,71 @@ const PDF_NOISE_LINES = [
   /verified by/i,
 ];
 
+/**
+ * Detects whether PDF text has been extracted RTL-reversed (mirrored).
+ * Weezmo and some other Israeli PDF generators produce this artifact.
+ *
+ * Detection: if >30% of Hebrew-containing lines are char-reversed
+ * (i.e., reversing the chars produces recognizable Hebrew words)
+ */
+function isTextRtlReversed(text: string): boolean {
+  const hebrewLines = text
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => /[\u05d0-\u05ea]/.test(l) && l.length > 3);
+
+  if (hebrewLines.length === 0) return false;
+
+  // Known reversed markers — if we see these, text is definitely reversed
+  const reversedMarkers = [
+    "בשחוממ ךמסמ",   // "מסמך ממוחשב" reversed
+    ":קסע םש",       // "שם עסק:" reversed
+    ":ךיראת",        // "תאריך:" reversed
+    "ללכ",           // various
+  ];
+
+  return reversedMarkers.some(marker => text.includes(marker));
+}
+
+/**
+ * Reverses each line's characters to fix RTL-mirrored PDF text.
+ * "תולעמ םראפ-רפוס" → "סופר-פארם מעלות"
+ * Numbers and mixed lines are handled gracefully.
+ */
+function fixRtlReversedText(text: string): string {
+  return text
+    .split("\n")
+    .map(line => {
+      const trimmed = line.trim();
+      // Only reverse lines that contain Hebrew
+      if (/[\u05d0-\u05ea]/.test(trimmed)) {
+        return trimmed.split("").reverse().join("");
+      }
+      return trimmed;
+    })
+    .join("\n");
+}
+
+/**
+ * Decides whether extracted PDF text is usable for invoice parsing.
+ */
 function isPdfTextUsable(text: string): boolean {
   if (!text || text.length === 0) return false;
 
-  // Check 1: PUA (Private Use Area) ratio — garbled custom fonts
+  // Check PUA (garbled custom fonts)
   let pua = 0;
   let total = 0;
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0;
-    const isPUA = cp >= 0xe000 && cp <= 0xf8ff;
-    if (isPUA) pua++;
+    if (cp >= 0xe000 && cp <= 0xf8ff) pua++;
     total++;
   }
   if (total > 0 && pua / total > 0.15) {
-    console.log(`[parse] PDF rejected: ${(pua/total*100).toFixed(0)}% PUA chars (garbled font)`);
+    console.log(`[parse] PDF rejected: ${(pua / total * 100).toFixed(0)}% PUA chars`);
     return false;
   }
 
-  // Check 2: meaningful content length
-  // Strip known noise lines and see what's left
+  // Check meaningful content length after stripping noise
   const meaningfulLines = text
     .split("\n")
     .map(l => l.trim())
@@ -65,11 +101,8 @@ function isPdfTextUsable(text: string): boolean {
     .filter(l => !PDF_NOISE_LINES.some(p => p.test(l)));
 
   const meaningfulText = meaningfulLines.join("\n");
-
-  // Need at least 100 chars of actual invoice content
-  // (a real invoice has amounts, dates, items — way more than 100 chars)
   if (meaningfulText.length < 100) {
-    console.log(`[parse] PDF rejected: only ${meaningfulText.length} meaningful chars (image-based PDF)`);
+    console.log(`[parse] PDF rejected: only ${meaningfulText.length} meaningful chars`);
     return false;
   }
 
@@ -77,8 +110,7 @@ function isPdfTextUsable(text: string): boolean {
 }
 
 /**
- * Converts the first page of a PDF buffer to a JPEG image blob
- * using pdf2pic (wraps Ghostscript/GraphicsMagick).
+ * Converts the first page of a PDF buffer to a JPEG image blob via Ghostscript.
  */
 async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
   try {
@@ -98,7 +130,7 @@ async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     return new Blob([ab as ArrayBuffer], { type: "image/jpeg" });
   } catch (err) {
-    console.warn("[parse] pdf2pic conversion failed:", err);
+    console.warn("[parse] pdf2pic failed:", err);
     return null;
   }
 }
@@ -133,14 +165,20 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (file.type === "application/pdf") {
       const pdfBuffer = Buffer.from(await file.arrayBuffer());
 
-      // Step 1: try embedded text
+      // Step 1: extract embedded text
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pdfParse = require("pdf-parse/lib/pdf-parse.js");
       const pdfData = await pdfParse(pdfBuffer);
-      const rawText: string = pdfData.text ?? "";
+      let rawText: string = pdfData.text ?? "";
 
+      // Step 2: fix RTL-reversed text (weezmo artifact)
+      if (isTextRtlReversed(rawText)) {
+        console.log("[parse] PDF: detected RTL-reversed text, fixing...");
+        rawText = fixRtlReversedText(rawText);
+      }
+
+      // Step 3: check if usable
       if (isPdfTextUsable(rawText)) {
-        // Good embedded text — use directly (fast, no OCR needed)
         console.log("[parse] PDF: using embedded text");
         const prompt = buildParsePrompt(rawText, categories);
         const { result: parsedInvoice, payload: llmPayload } = await parseInvoiceWithLlm(prompt);
@@ -156,7 +194,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         });
       }
 
-      // Step 2: fallback — convert PDF page to image → OCR
+      // Step 4: fallback — convert to image → OCR
       console.log("[parse] PDF: falling back to image OCR");
       const imageBlob = await pdfPageToImageBlob(pdfBuffer);
 
@@ -177,7 +215,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         });
       }
 
-      // Step 3: both failed
       return NextResponse.json(
         { error: "לא ניתן לחלץ טקסט מה-PDF. נסה להמיר לתמונה (JPG/PNG) ולהעלות שוב." },
         { status: 400 }
