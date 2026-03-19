@@ -34,12 +34,13 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
 
 // ─── OCR ─────────────────────────────────────────────────────────────────────
 
-export async function extractTextViaOcr(file: File): Promise<string> {
+export async function extractTextViaOcr(file: File): Promise<{ text: string; ms: number }> {
   const { blob, filename } = await normalizeImageForOcr(file);
   const formData = new FormData();
   formData.append("image", blob, filename);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
+  const t0 = Date.now();
   try {
     const res = await fetch(AI_CONFIG.ocrUrl, {
       method: "POST",
@@ -53,62 +54,36 @@ export async function extractTextViaOcr(file: File): Promise<string> {
     const data = await res.json();
     const text: string = data.text ?? data.result ?? JSON.stringify(data);
     if (!text?.trim()) throw new Error("OCR service returned empty text");
-    return text;
+    return { text, ms: Date.now() - t0 };
   } finally {
     clearTimeout(timer);
   }
 }
 
 // ─── Text pre-processing ──────────────────────────────────────────────────────
-/**
- * Normalizes numbers and dates in OCR text before sending to LLM.
- *
- * COMMA HANDLING — two cases, opposite treatment:
- *   1. Thousands separator (English): 1,769.94 → 1769.94  (comma between digit and 3-digit group, followed by decimal point)
- *   2. Decimal separator (Hebrew/Israeli): 310,50 → 310.50  (comma between digits where right side is exactly 2 digits with no decimal)
- *
- * Rule: if comma is followed by exactly 2 digits (no more) → decimal separator → replace with dot
- *       if comma is followed by exactly 3 digits → thousands separator → remove comma
- */
+
 export function preprocessOcrText(raw: string): string {
   let text = raw;
-
-  // Case 1: thousands separator — digit,3digits (optionally followed by decimal dot)
-  // e.g. 1,769.94 → 1769.94 | 1,000 → 1000
-  // Only remove if the 3 digits are followed by a dot or non-digit (ensures it's really thousands)
+  // Thousands separator (English): 1,769.94 → 1769.94
   text = text.replace(/(\d),(\d{3})(?=\.\d|\D|$)/g, "$1$2");
-
-  // Case 2: Israeli decimal comma — digit,2digits (NOT followed by more digits)
-  // e.g. 310,50 → 310.50 | 47,00 → 47.00
+  // Decimal comma (Israeli): 310,50 → 310.50
   text = text.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
-
-  // Normalize dot-separated dates: 26.02.2026 → 26/02/2026
-  // (only when pattern is clearly a date: 1-2 digits . 2 digits . 4 digits)
+  // Dot dates: 26.02.2026 → 26/02/2026
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
-
   return text;
 }
 
 // ─── Business name extraction ─────────────────────────────────────────────────
-/**
- * Extracts business name from OCR text.
- *
- * Strategy:
- * 1. בע"מ / Ltd line in the first 8 lines → official registered name
- * 2. Explicit label (שם העסק:) in first 8 lines
- * 3. First line with meaningful Hebrew/Latin text (not numbers/symbols)
- * 4. Domain/email at the end (e.g. hermitage.co.il → Hermitage)
- *
- * Also SKIPS known PDF header noise like "מסמך ממוחשב", "Page 1 of 1", "www.weezmo.com"
- */
+
 const NOISE_PATTERNS = [
   /מסמך ממוחשב/,
   /מסמך זה הינו/,
   /page \d+ of \d+/i,
   /weezmo/i,
-  /verified by/i,
+  /info@weezmo/i,
   /חתימה אלקטרונית/,
   /הוראות ניהול ספרים/,
+  /verified by/i,
 ];
 
 export function extractBusinessName(ocrText: string): string {
@@ -116,31 +91,25 @@ export function extractBusinessName(ocrText: string): string {
     .split("\n")
     .map(l => l.trim())
     .filter(l => l.length > 1)
-    // Filter out known PDF metadata/header noise
     .filter(l => !NOISE_PATTERNS.some(p => p.test(l)));
 
   const top = lines.slice(0, 10);
 
-  // Priority 1: line with בע"מ / Ltd in first 10 lines
   const companyLine = top.find(l => /בע[""']מ|בע"מ|בעמ|ltd\.?|llc\.?|inc\.?/i.test(l));
   if (companyLine) return companyLine.replace(/\d{2,}-\d{4,}/g, "").trim();
 
-  // Priority 2: explicit label prefix
   const labelLine = top.find(l => /^(שם העסק|עסק|מסעדה|חנות|סניף|name)\s*[:\-]/i.test(l));
   if (labelLine) return labelLine.replace(/^[^:\-]+[:\-]\s*/, "").trim();
 
-  // Priority 3: first line with enough Hebrew/Latin text (not mostly numbers/symbols)
   const textLine = top.find(l => {
     const hebrewOrLatin = l.replace(/[^א-תa-z\s]/gi, "").trim();
     return hebrewOrLatin.length >= 3 && hebrewOrLatin.length >= l.length * 0.4;
   });
   if (textLine) return textLine.trim();
 
-  // Priority 4: extract from domain/email at the END of the document
   const allLines = lines;
   const domainLine = allLines.slice(-10).find(l =>
-    /www\.|\.co\.il|\.com/i.test(l) &&
-    !/weezmo|info@weezmo/.test(l) // skip known non-business domains
+    /www\.|\.co\.il|\.com/i.test(l) && !/weezmo|info@weezmo/.test(l)
   );
   if (domainLine) {
     const match = domainLine.match(/(?:www\.)?([a-z0-9\-]+)(?:\.co\.il|\.com)/i);
@@ -192,14 +161,13 @@ function getCategoryHint(categoryName: string): string | null {
 }
 
 // ─── JSON repair ──────────────────────────────────────────────────────────────
+
 function repairAndParseJson(raw: string): ParsedInvoice | null {
-  // First try: complete JSON
   const fullMatch = raw.match(/\{[\s\S]*\}/);
   if (fullMatch) {
     try { return JSON.parse(fullMatch[0]); } catch { /* fall through */ }
   }
 
-  // Second try: truncated JSON — close open string + object
   let partial = raw;
   const start = partial.indexOf("{");
   if (start === -1) return null;
@@ -212,7 +180,6 @@ function repairAndParseJson(raw: string): ParsedInvoice | null {
     if (obj.amount !== undefined || obj.date !== undefined) return obj;
   } catch { /* fall through */ }
 
-  // Third try: regex field extraction
   const amount = raw.match(/"amount"\s*:\s*([\d.]+)/)?.[1];
   const date = raw.match(/"date"\s*:\s*"([^"]+)"/)?.[1];
   const type = raw.match(/"type"\s*:\s*"([^"]+)"/)?.[1];
@@ -240,7 +207,7 @@ interface LlmPayload {
 
 export async function parseInvoiceWithLlm(
   prompt: string
-): Promise<{ result: ParsedInvoice; payload: LlmPayload }> {
+): Promise<{ result: ParsedInvoice; payload: LlmPayload; ms: number }> {
   const payload: LlmPayload = {
     model: AI_CONFIG.llmModel,
     prompt,
@@ -251,6 +218,7 @@ export async function parseInvoiceWithLlm(
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
+  const t0 = Date.now();
   try {
     const res = await fetch(AI_CONFIG.llmUrl, {
       method: "POST",
@@ -263,11 +231,11 @@ export async function parseInvoiceWithLlm(
       throw new Error(`LLM service returned ${res.status}: ${detail}`);
     }
     const llmData = await res.json();
+    const ms = Date.now() - t0;
     const rawText: string = llmData.response?.trim() ?? "";
     let result = repairAndParseJson(rawText);
     if (!result) throw new Error(`LLM returned no parseable JSON. Raw: ${rawText.slice(0, 200)}`);
 
-    // Sanitize amount
     if (typeof result.amount === "string") {
       result = { ...result, amount: parseFloat((result.amount as string).replace(/,/g, "")) };
     }
@@ -277,7 +245,7 @@ export async function parseInvoiceWithLlm(
       if (m) result.amount = parseFloat(m[1]);
     }
 
-    return { result, payload };
+    return { result, payload, ms };
   } finally {
     clearTimeout(timer);
   }
@@ -290,11 +258,19 @@ export interface PipelineResult {
   ocrText: string;
   prompt: string;
   llmPayload: LlmPayload;
+  timings: { ocr: number; llm: number; total: number };
 }
 
 export async function runParsingPipeline(file: File, categories: string[]): Promise<PipelineResult> {
-  const ocrText = await extractTextViaOcr(file);
+  const t0 = Date.now();
+  const { text: ocrText, ms: ocrMs } = await extractTextViaOcr(file);
   const prompt = buildParsePrompt(ocrText, categories);
-  const { result: parsedInvoice, payload: llmPayload } = await parseInvoiceWithLlm(prompt);
-  return { parsedInvoice, ocrText, prompt, llmPayload };
+  const { result: parsedInvoice, payload: llmPayload, ms: llmMs } = await parseInvoiceWithLlm(prompt);
+  return {
+    parsedInvoice,
+    ocrText,
+    prompt,
+    llmPayload,
+    timings: { ocr: ocrMs, llm: llmMs, total: Date.now() - t0 },
+  };
 }
