@@ -21,7 +21,7 @@
 | DB | Prisma + SQLite |
 | Auth | NextAuth v5 (credentials) |
 | OCR | Tesseract (node-tesseract-ocr, PSM 6, heb+eng) |
-| LLM | Ollama local — gemma3:4b |
+| LLM | Ollama local — **qwen2.5:3b** (החלפה מ-gemma3:4b) |
 | Image processing | sharp |
 | PDF processing | pdf-parse + pdf2pic + ghostscript |
 
@@ -39,7 +39,23 @@
 | OCR service | `home-manager-ocr-service-1` on port 5050 |
 | LLM | `ollamaQwen7B` container on port 11434 |
 
-**Server specs:** AMD EPYC 8 cores, 15GB RAM, no GPU → LLM runs on CPU (~15-30s per invoice)
+**Server specs:** AMD EPYC 8 cores, 15GB RAM, no GPU → LLM runs on CPU
+
+---
+
+## LLM Models on Server
+
+| מודל | גודל | סטטוס | זמן תגובה |
+|------|------|--------|-----------|
+| `qwen2.5:3b` | 1.9GB | ✅ **פעיל** | ~6-12 שניות |
+| `gemma3:4b` | 3.3GB | ⚠️ installed (backup) | ~35-50 שניות |
+| `smollm2:135m` | 270MB | ❌ **נמחק** | — |
+
+**למה qwen2.5:3b עדיף:**
+- מצוין לעברית (Alibaba multilingual training)
+- 1.9GB במקום 3.3GB → פחות לחץ על swap
+- ~21 tokens/sec vs ~8 tokens/sec של gemma3
+- benchmark: 5.8s vs 35-50s (!!)
 
 ---
 
@@ -61,25 +77,25 @@ src/
 │       ├── invoices/route.ts       — POST invoice
 │       ├── invoices/[id]/route.ts  — PATCH/DELETE invoice
 │       ├── parse/route.ts          — OCR+LLM pipeline (user-facing)
-│       ├── internal/parse/route.ts — Internal API endpoint (machine-to-machine)
+│       ├── internal/parse/route.ts — Internal API (machine-to-machine) ← אל תגע!
 │       └── reports/
 │           ├── data/route.ts       — GET invoices by month
 │           ├── export/route.ts     — Excel export
 │           ├── pdf/route.ts        — HTML print-ready report
-│           └── download-zip/route.ts — ZIP of invoice files
+│           └── download-zip/route.ts
 ├── components/
-│   ├── Dashboard.tsx               — Main dashboard
+│   ├── Dashboard.tsx
 │   └── Navbar.tsx
 └── lib/
     ├── config.ts                   — AI_CONFIG, STORAGE_CONFIG, DEFAULT_CATEGORIES
     ├── types.ts                    — InvoiceDTO, CategoryDTO, ParsedInvoice
     ├── parse-service.ts            — Full OCR+LLM pipeline
-    └── prisma.ts                   — Prisma client singleton
+    └── prisma.ts
 ```
 
 ---
 
-## Internal API (machine-to-machine)
+## ⚠️ CRITICAL — Internal API (אל תשנה!)
 
 **Endpoint:** `POST /api/internal/parse`
 **Header:** `x-internal-key: <INTERNAL_API_KEY>`
@@ -87,27 +103,19 @@ src/
 ```json
 {
   "success": true,
-  "data": {
-    "amount": 248.7,
-    "date": "2026-02-23",
-    "type": "מזון",
-    "description": "סופר-פארם מעלות"
-  },
-  "timings": { "ocr": 1900, "llm": 18400, "total": 20300 }
+  "data": { "amount": 248.7, "date": "2026-02-23", "type": "מזון", "description": "סופר-פארם מעלות" },
+  "timings": { "ocr": 1900, "llm": 5800, "total": 7700 }
 }
 ```
-
-**משתנה סביבה:** `INTERNAL_API_KEY=6fb6447f6e5f461b86dca1abb68cdc66`
-(מוגדר ב-`/opt/invoice-scanner/.env` ומועבר ל-Docker דרך docker-compose.yml)
-
-**שימוש בפרויקט home-manager:** שולח קובץ תמונה/PDF ומקבל נתוני חשבונית מפוענחים ללא צורך ב-UI.
+**INTERNAL_API_KEY=6fb6447f6e5f461b86dca1abb68cdc66** (ב-.env בשרת)
+**שימוש:** home-manager שולח קובץ ומקבל נתוני חשבונית — אל תגע בendpoint הזה!
 
 ---
 
 ## Deployment
 
 ```bash
-# Deploy update (מ-Windows):
+# Deploy update:
 cd D:\Projects\Antigravity\invoice-scanner
 git add -A && git commit -m "message" && git push origin main
 
@@ -115,7 +123,7 @@ git add -A && git commit -m "message" && git push origin main
 ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && git pull && docker compose down && docker compose build --no-cache && docker compose up -d"
 
 # Quick restart (no rebuild):
-ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && docker compose restart"
+ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && docker compose down && docker compose up -d"
 
 # Health check:
 curl http://116.203.149.15:3005/api/health
@@ -124,8 +132,6 @@ curl http://116.203.149.15:3005/api/health
 ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
 ```
 
-**Server .env location:** `/opt/invoice-scanner/.env`
-
 ---
 
 ## Parse Pipeline (parse-service.ts)
@@ -133,49 +139,26 @@ ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
 ```
 קובץ הועלה (תמונה / PDF)
         ↓
-[PDF] pdf-parse → בדיקת RTL reversal → תיקון → בדיקת איכות טקסט
-      ↓ אם ריק/גרוע → pdf2pic (Ghostscript) → תמונה
-[תמונה] sharp → rotate (EXIF) + sharpen(σ1.2) + normalize + resize 2400px, quality 92
+[PDF] pdf-parse → RTL reversal check → fix → quality check
+      ↓ אם ריק/גרוע → pdf2pic (Ghostscript) → image
+[Image] sharp → rotate(EXIF) + sharpen(σ1.2) + normalize + resize 2400px, q92
         ↓
 OCR (Tesseract port 5050, PSM 6, heb+eng)
         ↓
-preprocessOcrText() — תיקון פסיקים עשרוניים/אלפים + תאריכים
+preprocessOcrText() — decimal comma fix + date normalization
         ↓
-extractBusinessName() — חילוץ שם עסק server-side (לפני LLM)
+extractBusinessName() — server-side, before LLM
         ↓
-extractInvoiceContext() — HEAD(400) + expanding window search לסכום
-        ↓ חיפוש ב: 25% → 50% → 75% → 100% + סינון boilerplate
-buildParsePrompt() — prompt ממוקד ~500-700 תווים
+extractInvoiceContext() — HEAD(400) + expanding window search (25%→50%→75%→100%)
         ↓
-LLM (Ollama gemma3:4b, temperature=0, num_predict=200)
+buildParsePrompt() — ~500-700 chars focused prompt
         ↓
-repairAndParseJson() — תיקון JSON חתוך/שבור
+LLM (Ollama qwen2.5:3b, temperature=0, num_predict=200)
+        ↓
+repairAndParseJson()
         ↓
 {amount, date, type, description}
 ```
-
----
-
-## Key Implementation Details
-
-### PDF Types Handled
-1. **Text PDF readable:** חשמל, חשבוניות רגילות → pdf-parse ישיר
-2. **RTL Reversed (weezmo):** סופר-פארם, KSP → `smartReverseRtlLine()` + preserves numbers
-3. **Image-based PDF:** מקדונלדס, Amazon, Hermitage → Ghostscript → image → OCR
-
-### Smart Context Extraction
-חשבוניות גדולות (KSP = 14,000 תווים) מכילות תנאי אחריות ארוכים.
-`extractInvoiceContext()`: HEAD 400 תווים + expanding window search לסכום (25%→50%→75%→100%).
-מסנן boilerplate (תנאי אחריות, ביטול עסקה, הגנת הצרכן).
-
-### Amount Extraction Rules (בפרומפט)
-- סדר עדיפות: `סה"כ לתשלום > לתשלום > Grand Total > סה"כ`
-- תמיד לקחת את **הגדול ביותר** = כולל מע"מ
-- לא לקחת: `סה"כ ללא מע"מ`, מחיר ליחידה, מע"מ בנפרד
-
-### Description Field
-**שם עסק בלבד** — המלא והמדויק כפי שמופיע בחשבונית.
-דוגמאות: `"63 קיי אס פי מחשבים אילת"`, `"סופר-פארם מעלות"`.
 
 ---
 
@@ -183,12 +166,12 @@ repairAndParseJson() — תיקון JSON חתוך/שבור
 
 | פרמטר | ערך | סיבה |
 |-------|-----|------|
-| PSM | 6 | Single block — מתאים לקבלות (שונה מ-3 שהיה קודם) |
+| PSM | 6 | Single block — receipts |
 | OEM | 1 | LSTM neural network |
-| Lang | heb+eng | עברית + אנגלית |
-| Sharp sigma | 1.2 | מחדד טקסט מצילום נייד |
-| Normalize | ✅ | מאזן תאורה לא אחידה |
-| JPEG quality | 92 | פחות artifacts על טקסט קטן |
+| Lang | heb+eng | Hebrew + English |
+| Sharp sigma | 1.2 | sharpen blurry mobile text |
+| Normalize | ✅ | fix uneven lighting |
+| JPEG quality | 92 | less artifacts on small text |
 
 ---
 
@@ -200,57 +183,32 @@ repairAndParseJson() — תיקון JSON חתוך/שבור
 | `AUTH_URL` | `http://116.203.149.15:3005` | כתובת האפליקציה |
 | `OCR_API_URL` | `http://host.docker.internal:5050/ocr/file` | שירות OCR |
 | `LLM_API_URL` | `http://host.docker.internal:11434/api/generate` | Ollama |
-| `LLM_MODEL` | `gemma3:4b` | מודל LLM |
-| `AI_TIMEOUT_MS` | `55000` | timeout לקריאות AI |
+| `LLM_MODEL` | `qwen2.5:3b` | מודל LLM |
+| `AI_TIMEOUT_MS` | `55000` | timeout |
 | `INTERNAL_API_KEY` | — | מפתח לendpoint פנימי |
-
----
-
-## Known Issues & Limitations
-
-1. **OCR מהנייד < OCR ממחשב** — JPEG compression + perspective distortion. שופר עם sharp preprocessing ו-PSM 6.
-2. **LLM מהירות** — ~15-30 שניות. נובע מ-CPU בלבד. gemma3:4b הוא האופטימלי על ה-hardware הנוכחי.
-3. **KSP multi-page PDF** — הסכום בעמוד 2. נפתר עם expanding window search.
-
----
-
-## Planned / Future Features
-
-- [ ] Background job לפירוק פריטים מחשבונית (items[] + price per item)
-- [ ] שמירת rawText ב-DB לreprocessing
-- [ ] Deskew/perspective correction לצילומי נייד
 
 ---
 
 ## Session History
 
 ### Session 1 (מרץ 2026) — הקמה
-- הקמת פרויקט בסיסי: Next.js + Prisma + NextAuth + OCR + LLM
-- Deploy ל-Docker על שרת Hetzner
-- תיקון UntrustedHost (NextAuth v5)
-- תיקון PDF parsing (pdf-parse + standalone bundle)
-- הוספת manual entry mode (2 tabs)
-- הוספת ZIP download + Hebrew PDF report
+- הקמת פרויקט: Next.js + Prisma + NextAuth + OCR + LLM
+- Deploy ל-Docker, תיקון UntrustedHost
+- manual entry mode, ZIP download, Hebrew PDF report
 
 ### Session 2 (מרץ 2026) — שיפורי parsing
-- תיקון EXIF rotation לתמונות מנייד (sharp .rotate())
-- שדרוג LLM prompt: חילוץ שם עסק server-side, קטגוריות מה-DB עם hints
-- description = שם עסק בלבד (לא מה נרכש)
-- תיקון RTL reversed text מ-weezmo PDFs (smartReverseRtlLine)
-- תיקון decimal comma: 310,50 → 310.50
-- PDF fallback pipeline: Ghostscript + pdf2pic לimage-based PDFs
-- Smart context extraction: expanding window search (25%→50%→75%→100%)
-- Timing display (OCR ms + LLM ms + total) בממשק
-- Mobile: כפתורי עריכה/מחיקה תמיד גלויים
-- OCR tuning: PSM 3→6, sharpen(σ1.2), normalize, quality 92
-- Amount rule: תמיד הגדול ביותר = כולל מע"מ
+- EXIF rotation fix, RTL reversal fix (weezmo)
+- Smart context extraction (expanding window)
+- Decimal comma fix, description = שם עסק בלבד
+- PDF fallback (Ghostscript), timing display
+- OCR: PSM 3→6, sharpen, normalize
 
-### Session 3 (מרץ 2026) — Internal API
-- נוסף endpoint: `POST /api/internal/parse`
-- מוגן ב-`x-internal-key` header
-- מחזיר `{ success, data: { amount, date, type, description }, timings }`
-- נוסף `INTERNAL_API_KEY` ל-`.env` ול-`docker-compose.yml`
-- הפרויקט משמש עכשיו כ-service עבור home-manager
+### Session 3 (מרץ 2026) — Internal API + LLM upgrade
+- נוסף `POST /api/internal/parse` לintegration עם home-manager
+- **החלפת LLM: gemma3:4b → qwen2.5:3b**
+- מחיקת smollm2:135m (לא בשימוש)
+- ביצועים: 35-50s → **~6-12s** ✅
+- docker-compose.yml: default LLM_MODEL עודכן ל-qwen2.5:3b
 
 ---
 *עודכן לאחרונה: מרץ 2026 — Session 3*
