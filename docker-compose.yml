@@ -32,6 +32,9 @@ services:
 
       STORAGE_ROOT: "storage/expenses"
 
+      # Internal API (for home-manager integration)
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY}"
+
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
