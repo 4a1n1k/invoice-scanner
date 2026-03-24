@@ -89,21 +89,22 @@ async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
 
 // ── Smart URL extraction ──────────────────────────────────────────────────────
 //
-// SMS messages often contain multiple URLs:
-//   - Privacy policy / terms  → skip
-//   - The actual receipt link → prefer
+// SMS messages often contain multiple URLs, e.g.:
+//   "בהתאם למדיניות הפרטיות: https://wee.ai/l/xxx   לצפייה: https://wee.ai/r/yyy"
 //
-// Strategy:
-//   1. Prefer URL after receipt-related keywords (לצפייה, חשבונית, קבלה...)
-//   2. Fall back to first URL NOT preceded by privacy/legal keywords
-//   3. Last URL in text (receipt usually comes after privacy link)
-//   4. LLM fallback for unusual formats
+// Strategy (3 passes):
+//   Pass 1 — URL after explicit receipt keyword AND without skip keyword nearby (strict)
+//   Pass 2 — URL NOT preceded by a privacy/legal keyword
+//   Pass 3 — Last URL in text (receipt link usually comes after privacy link)
+//
+// NOTE: 'קבלה' intentionally excluded from Pass 1 — too generic.
+//       It appears in general SMS text ("הגיעה אליך קבלה") before the privacy URL.
 
 const RECEIPT_KEYWORDS_BEFORE =
-  /לצפ|לצפיה|לצפייה|חשבונ|קבל[הת]|receipt|invoice|view|לפרט|פרטי.?הקנ/i;
+  /לצפ|לצפיה|לצפייה|חשבונ|receipt|invoice|view/i;
 
 const SKIP_KEYWORDS_BEFORE =
-  /פרטי[ו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
+  /פרטי[וו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
 
 function extractBestUrl(text: string): string | null {
   const matches = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
@@ -116,10 +117,10 @@ function extractBestUrl(text: string): string | null {
 
   if (urls.length === 1) return urls[0].url;
 
-  // Pass 1: URL following a receipt keyword (within 40 chars)
+  // Pass 1: receipt keyword nearby AND no skip keyword (strict)
   for (const { url, index } of urls) {
     const before = text.slice(Math.max(0, index - 40), index);
-    if (RECEIPT_KEYWORDS_BEFORE.test(before)) return url;
+    if (RECEIPT_KEYWORDS_BEFORE.test(before) && !SKIP_KEYWORDS_BEFORE.test(before)) return url;
   }
 
   // Pass 2: URL NOT preceded by a skip keyword (within 60 chars)
@@ -128,7 +129,7 @@ function extractBestUrl(text: string): string | null {
     if (!SKIP_KEYWORDS_BEFORE.test(before)) return url;
   }
 
-  // Pass 3: last URL (receipt usually comes after privacy link)
+  // Pass 3: last URL (receipt link usually comes after privacy link)
   return urls[urls.length - 1].url;
 }
 

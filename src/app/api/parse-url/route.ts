@@ -50,24 +50,24 @@ function htmlToText(html: string): string {
 
 // ── Smart URL extraction ──────────────────────────────────────────────────────
 //
-// SMS messages often contain multiple URLs:
-//   - Privacy policy / terms (to skip)
-//   - The actual receipt link (to use)
+// SMS messages often contain multiple URLs, e.g.:
+//   "בהתאם למדיניות הפרטיות: https://wee.ai/l/xxx   לצפייה: https://wee.ai/r/yyy"
 //
-// Strategy:
-//   1. Prefer URL that appears after receipt-related keywords (לצפייה, חשבונית, קבלה...)
-//   2. Fall back to first URL NOT preceded by privacy/legal keywords
-//   3. Last resort: any URL in text
-//   4. If still none: ask LLM
+// Strategy (3 passes):
+//   Pass 1 — URL after explicit receipt keyword AND without skip keyword nearby (strict)
+//   Pass 2 — URL NOT preceded by a privacy/legal keyword
+//   Pass 3 — Last URL in text (receipt link usually comes after privacy link)
+//
+// NOTE: 'קבלה' intentionally excluded from Pass 1 — too generic.
+//       It appears in general SMS text ("הגיעה אליך קבלה") before the privacy URL.
 
 const RECEIPT_KEYWORDS_BEFORE =
-  /לצפ|לצפיה|לצפייה|חשבונ|קבל[הת]|receipt|invoice|view|לפרט|פרטי.?הקנ/i;
+  /לצפ|לצפיה|לצפייה|חשבונ|receipt|invoice|view/i;
 
 const SKIP_KEYWORDS_BEFORE =
-  /פרטי[ו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
+  /פרטי[וו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
 
 function extractBestUrl(text: string): string | null {
-  // Collect all URLs with their positions
   const matches = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
   if (matches.length === 0) return null;
 
@@ -78,10 +78,10 @@ function extractBestUrl(text: string): string | null {
 
   if (urls.length === 1) return urls[0].url;
 
-  // Pass 1: URL immediately following a receipt keyword (within 40 chars)
+  // Pass 1: receipt keyword nearby AND no skip keyword (strict)
   for (const { url, index } of urls) {
     const before = text.slice(Math.max(0, index - 40), index);
-    if (RECEIPT_KEYWORDS_BEFORE.test(before)) return url;
+    if (RECEIPT_KEYWORDS_BEFORE.test(before) && !SKIP_KEYWORDS_BEFORE.test(before)) return url;
   }
 
   // Pass 2: URL NOT preceded by a skip keyword (within 60 chars)
@@ -90,17 +90,16 @@ function extractBestUrl(text: string): string | null {
     if (!SKIP_KEYWORDS_BEFORE.test(before)) return url;
   }
 
-  // Pass 3: last URL in text (usually the receipt link comes after privacy link)
+  // Pass 3: last URL (receipt link usually comes after privacy link)
   return urls[urls.length - 1].url;
 }
 
 async function extractUrlFromText(text: string): Promise<string | null> {
-  // Fast path: smart regex extraction
   const url = extractBestUrl(text);
   if (url) return url;
 
-  // LLM fallback (for very unusual formats)
-  const prompt = `הטקסט הבא מכיל קישור לחשבונית דיגיטלית. חלץ את ה-URL של החשבונית בלבד (לא קישורי מדיניות פרטיות או תקנון).
+  // LLM fallback (rare)
+  const prompt = `הטקסט הבא מכיל קישור לחשבונית דיגיטלית. חלץ את ה-URL של החשבונית בלבד (לא קישורי מדיניות פרטיות).
 אם אין URL לחשבונית, החזר null.
 טקסט: ${text.slice(0, 600)}
 החזר JSON בלבד: {"url":"..."} או {"url":null}`;
@@ -208,9 +207,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const receipt = await fetchReceiptByUrl(url);
       const invoiceData = receiptDataToInvoice(receipt, categories);
       return NextResponse.json({
-        data: invoiceData,
-        url,
-        provider,
+        data: invoiceData, url, provider,
         timings: { ocr: 0, llm: 0, total: Date.now() - t0 },
         debug: { url, rawJson: receipt.rawJson },
       });
@@ -238,8 +235,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const platformName = provider === "weezmo" ? "Weezmo" : provider === "pairzon" ? "Pairzon" : "האתר";
     return NextResponse.json({
       error: `הקישור מ-${platformName} לא ניתן לקריאה ישירה.`,
-      isSpa: true,
-      url,
+      isSpa: true, url,
       suggestion: `צלם סקרינשוט של החשבונית ועלה אותו דרך טאב "סריקה".`,
     }, { status: 422 });
   }
@@ -249,8 +245,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const { result: parsedInvoice, ms: llmMs } = await parseInvoiceWithLlm(prompt);
 
   return NextResponse.json({
-    data: parsedInvoice,
-    url,
+    data: parsedInvoice, url,
     timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
     debug: { url, prompt, ocrResponse: pageText.slice(0, 500) + "…" },
   });
