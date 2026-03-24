@@ -87,16 +87,59 @@ async function pdfPageToImageBlob(pdfBuffer: Buffer): Promise<Blob | null> {
   } catch { return null; }
 }
 
-// ── URL extraction ────────────────────────────────────────────────────────────
+// ── Smart URL extraction ──────────────────────────────────────────────────────
+//
+// SMS messages often contain multiple URLs:
+//   - Privacy policy / terms  → skip
+//   - The actual receipt link → prefer
+//
+// Strategy:
+//   1. Prefer URL after receipt-related keywords (לצפייה, חשבונית, קבלה...)
+//   2. Fall back to first URL NOT preceded by privacy/legal keywords
+//   3. Last URL in text (receipt usually comes after privacy link)
+//   4. LLM fallback for unusual formats
+
+const RECEIPT_KEYWORDS_BEFORE =
+  /לצפ|לצפיה|לצפייה|חשבונ|קבל[הת]|receipt|invoice|view|לפרט|פרטי.?הקנ/i;
+
+const SKIP_KEYWORDS_BEFORE =
+  /פרטי[ו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
+
+function extractBestUrl(text: string): string | null {
+  const matches = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
+  if (matches.length === 0) return null;
+
+  const urls = matches.map(m => ({
+    url: m[0].replace(/[.,;!?)\]]+$/, ""),
+    index: m.index ?? 0,
+  }));
+
+  if (urls.length === 1) return urls[0].url;
+
+  // Pass 1: URL following a receipt keyword (within 40 chars)
+  for (const { url, index } of urls) {
+    const before = text.slice(Math.max(0, index - 40), index);
+    if (RECEIPT_KEYWORDS_BEFORE.test(before)) return url;
+  }
+
+  // Pass 2: URL NOT preceded by a skip keyword (within 60 chars)
+  for (const { url, index } of urls) {
+    const before = text.slice(Math.max(0, index - 60), index);
+    if (!SKIP_KEYWORDS_BEFORE.test(before)) return url;
+  }
+
+  // Pass 3: last URL (receipt usually comes after privacy link)
+  return urls[urls.length - 1].url;
+}
 
 async function extractUrlFromText(text: string): Promise<string | null> {
-  const urlMatch = text.match(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/);
-  if (urlMatch) return urlMatch[0].replace(/[.,;!?)\]]+$/, "");
+  const url = extractBestUrl(text);
+  if (url) return url;
 
   // LLM fallback
-  const prompt = `הטקסט הבא מכיל קישור לחשבונית. חלץ את ה-URL המלא בלבד.
-אם אין URL, החזר null.
-טקסט: ${text.slice(0, 500)}
+  const prompt = `הטקסט הבא מכיל קישור לחשבונית דיגיטלית. חלץ את ה-URL של החשבונית בלבד (לא קישורי מדיניות פרטיות).
+אם אין URL לחשבונית, החזר null.
+טקסט: ${text.slice(0, 600)}
 החזר JSON בלבד: {"url":"..."} או {"url":null}`;
 
   const res = await fetch(AI_CONFIG.llmUrl, {
@@ -183,7 +226,6 @@ async function parseFile(file: File, categories: string[]) {
     throw new Error("לא ניתן לחלץ טקסט מה-PDF");
   }
 
-  // Image
   const { parsedInvoice, timings } = await runParsingPipeline(file, categories);
   return { data: { ...parsedInvoice, items: [] }, timings, source: "ocr" };
 }
@@ -193,9 +235,9 @@ async function parseFile(file: File, categories: string[]) {
 async function parseSmsText(text: string, categories: string[]) {
   const t0 = Date.now();
 
-  // 1. Extract URL
+  // 1. Extract receipt URL (smart — skips privacy/terms links)
   const url = await extractUrlFromText(text);
-  if (!url) throw new Error("לא נמצא קישור בטקסט");
+  if (!url) throw new Error("לא נמצא קישור חשבונית בטקסט");
 
   // 2. Known provider → direct API
   const provider = detectProvider(url);

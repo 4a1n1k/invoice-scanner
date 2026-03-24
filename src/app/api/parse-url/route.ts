@@ -48,16 +48,61 @@ function htmlToText(html: string): string {
     .trim();
 }
 
-// ── Extract URL from free text ────────────────────────────────────────────────
+// ── Smart URL extraction ──────────────────────────────────────────────────────
+//
+// SMS messages often contain multiple URLs:
+//   - Privacy policy / terms (to skip)
+//   - The actual receipt link (to use)
+//
+// Strategy:
+//   1. Prefer URL that appears after receipt-related keywords (לצפייה, חשבונית, קבלה...)
+//   2. Fall back to first URL NOT preceded by privacy/legal keywords
+//   3. Last resort: any URL in text
+//   4. If still none: ask LLM
+
+const RECEIPT_KEYWORDS_BEFORE =
+  /לצפ|לצפיה|לצפייה|חשבונ|קבל[הת]|receipt|invoice|view|לפרט|פרטי.?הקנ/i;
+
+const SKIP_KEYWORDS_BEFORE =
+  /פרטי[ו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
+
+function extractBestUrl(text: string): string | null {
+  // Collect all URLs with their positions
+  const matches = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
+  if (matches.length === 0) return null;
+
+  const urls = matches.map(m => ({
+    url: m[0].replace(/[.,;!?)\]]+$/, ""),
+    index: m.index ?? 0,
+  }));
+
+  if (urls.length === 1) return urls[0].url;
+
+  // Pass 1: URL immediately following a receipt keyword (within 40 chars)
+  for (const { url, index } of urls) {
+    const before = text.slice(Math.max(0, index - 40), index);
+    if (RECEIPT_KEYWORDS_BEFORE.test(before)) return url;
+  }
+
+  // Pass 2: URL NOT preceded by a skip keyword (within 60 chars)
+  for (const { url, index } of urls) {
+    const before = text.slice(Math.max(0, index - 60), index);
+    if (!SKIP_KEYWORDS_BEFORE.test(before)) return url;
+  }
+
+  // Pass 3: last URL in text (usually the receipt link comes after privacy link)
+  return urls[urls.length - 1].url;
+}
 
 async function extractUrlFromText(text: string): Promise<string | null> {
-  const urlMatch = text.match(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/);
-  if (urlMatch) return urlMatch[0].replace(/[.,;!?)\]]+$/, "");
+  // Fast path: smart regex extraction
+  const url = extractBestUrl(text);
+  if (url) return url;
 
-  // LLM fallback
-  const prompt = `הטקסט הבא מכיל קישור לחשבונית. חלץ את ה-URL המלא בלבד.
-אם אין URL, החזר null.
-טקסט: ${text.slice(0, 500)}
+  // LLM fallback (for very unusual formats)
+  const prompt = `הטקסט הבא מכיל קישור לחשבונית דיגיטלית. חלץ את ה-URL של החשבונית בלבד (לא קישורי מדיניות פרטיות או תקנון).
+אם אין URL לחשבונית, החזר null.
+טקסט: ${text.slice(0, 600)}
 החזר JSON בלבד: {"url":"..."} או {"url":null}`;
 
   const res = await fetch(AI_CONFIG.llmUrl, {
@@ -105,7 +150,6 @@ async function fetchReceiptPage(url: string): Promise<{ text: string; isSpa: boo
 // ── Convert ReceiptData to invoice fields ─────────────────────────────────────
 
 function receiptDataToInvoice(receipt: ReceiptData, categories: string[]) {
-  // Auto-categorize based on store name
   const name = receipt.storeName.toLowerCase();
   let type = categories[0] ?? "אחר";
   if (/סופר.פארם|superpharm|pharmacy|farmacia|pharma/i.test(name)) {
@@ -137,11 +181,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   if (!rawText)
     return NextResponse.json({ error: "לא התקבל טקסט" }, { status: 400 });
 
-  // 1. Extract URL
+  // 1. Extract URL (smart — prefers receipt link over privacy links)
   const url = await extractUrlFromText(rawText);
   if (!url)
     return NextResponse.json(
-      { error: "לא נמצא קישור בטקסט. ודא שהדבקת את המסרון המלא." },
+      { error: "לא נמצא קישור חשבונית בטקסט. ודא שהדבקת את המסרון המלא." },
       { status: 422 }
     );
 
@@ -157,7 +201,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   const t0 = Date.now();
 
-  // 3. Known provider → direct API (fast, accurate)
+  // 3. Known provider → direct API
   const provider = detectProvider(url);
   if (provider) {
     try {
@@ -171,14 +215,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         debug: { url, rawJson: receipt.rawJson },
       });
     } catch (err) {
-      // Provider API failed — fall through to generic HTML parsing
       console.warn(`[parse-url] ${provider} API failed, falling back to HTML:`, err);
     }
   }
 
   // 4. Generic HTML fallback
   let pageText: string;
-  let isSpa = !!provider; // known SPAs
+  let isSpa = !!provider;
   try {
     const result = await fetchReceiptPage(url);
     pageText = result.text;
