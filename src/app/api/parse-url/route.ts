@@ -1,11 +1,12 @@
 /**
  * POST /api/parse-url
  *
- * Accepts free-text (SMS message, email, etc.)
- * 1. Uses LLM to extract a URL from the text
- * 2. Fetches the URL server-side (no CORS / proxy issues)
- * 3. Strips HTML → plain text
- * 4. Uses LLM to parse invoice fields
+ * Accepts free-text (SMS / WhatsApp) and extracts invoice data.
+ *
+ * Strategy (priority order):
+ *   1. Detect known provider (Weezmo / Pairzon) → direct JSON API (fastest, 100% accurate)
+ *   2. Unknown URL → fetch HTML → strip tags → LLM parse (fallback)
+ *   3. SPA / empty page → return helpful error with suggestion
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -13,6 +14,11 @@ import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { AI_CONFIG, DEFAULT_CATEGORIES } from "@/lib/config";
 import { buildParsePrompt, parseInvoiceWithLlm } from "@/lib/parse-service";
+import {
+  detectProvider,
+  fetchReceiptByUrl,
+  type ReceiptData,
+} from "@/lib/receipt-providers";
 
 export const maxDuration = 60;
 
@@ -45,75 +51,78 @@ function htmlToText(html: string): string {
 // ── Extract URL from free text ────────────────────────────────────────────────
 
 async function extractUrlFromText(text: string): Promise<string | null> {
-  // Fast path: regex (handles 99% of cases — SMS links are plain text)
   const urlMatch = text.match(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/);
   if (urlMatch) return urlMatch[0].replace(/[.,;!?)\]]+$/, "");
 
-  // Slow path: LLM extraction (for obfuscated/wrapped text)
+  // LLM fallback
   const prompt = `הטקסט הבא מכיל קישור לחשבונית. חלץ את ה-URL המלא בלבד.
 אם אין URL, החזר null.
-
 טקסט: ${text.slice(0, 500)}
-
 החזר JSON בלבד: {"url":"..."} או {"url":null}`;
 
   const res = await fetch(AI_CONFIG.llmUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: AI_CONFIG.llmModel,
-      prompt,
-      stream: false,
-      format: "json",
+      model: AI_CONFIG.llmModel, prompt, stream: false, format: "json",
       options: { temperature: 0, num_predict: 100 },
     }),
   });
-
   if (!res.ok) return null;
   try {
     const data = await res.json();
     const parsed = JSON.parse(data.response ?? "{}");
     return parsed.url ?? null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ── Fetch URL ─────────────────────────────────────────────────────────────────
+// ── Fetch generic HTML page ───────────────────────────────────────────────────
 
-async function fetchReceiptPage(url: string): Promise<string> {
+async function fetchReceiptPage(url: string): Promise<{ text: string; isSpa: boolean }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
-
   try {
     const res = await fetch(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         Accept: "text/html,application/xhtml+xml,*/*",
         "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
       },
       signal: controller.signal,
     });
-
     if (!res.ok) throw new Error(`שגיאת HTTP ${res.status}`);
-
     const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("pdf")) {
-      throw new Error("הקישור מוביל ל-PDF. העלה אותו ישירות דרך סריקה.");
-    }
-
+    if (contentType.includes("pdf")) throw new Error("הקישור מוביל ל-PDF. העלה אותו דרך סריקה.");
     const html = await res.text();
     const text = htmlToText(html);
-
-    if (text.length < 50) {
-      throw new Error("הדף ריק — ייתכן שהקישור פג תוקף.");
-    }
-
-    return text;
+    const isSpa = html.length > 500 && text.length < 100;
+    return { text, isSpa };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ── Convert ReceiptData to invoice fields ─────────────────────────────────────
+
+function receiptDataToInvoice(receipt: ReceiptData, categories: string[]) {
+  // Auto-categorize based on store name
+  const name = receipt.storeName.toLowerCase();
+  let type = categories[0] ?? "אחר";
+  if (/סופר.פארם|superpharm|pharmacy|farmacia|pharma/i.test(name)) {
+    type = categories.find(c => /בריאות|רפואי|pharma/i.test(c)) ?? type;
+  } else if (/carrefour|קרפור|supermarket|סופר|רמי|שופרסל|ויקטורי|מגה/i.test(name)) {
+    type = categories.find(c => /מזון|אוכל|מכולת|קניות|food|grocery/i.test(c)) ?? type;
+  }
+
+  return {
+    amount: receipt.total,
+    date: receipt.date,
+    type,
+    description: receipt.storeName,
+    items: receipt.items,
+    storeAddress: receipt.storeAddress,
+    provider: receipt.provider,
+  };
 }
 
 // ── Route ─────────────────────────────────────────────────────────────────────
@@ -125,11 +134,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   const body = await req.json().catch(() => null);
   const rawText: string = body?.text?.trim() ?? "";
-
   if (!rawText)
     return NextResponse.json({ error: "לא התקבל טקסט" }, { status: 400 });
 
-  // 1. Find URL
+  // 1. Extract URL
   const url = await extractUrlFromText(rawText);
   if (!url)
     return NextResponse.json(
@@ -137,10 +145,44 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       { status: 422 }
     );
 
-  // 2. Fetch page
+  // 2. Get user categories
+  const userCategories = await prisma.category.findMany({
+    where: { userId: session.user.id },
+    select: { name: true },
+    orderBy: { name: "asc" },
+  });
+  const categories = userCategories.length > 0
+    ? userCategories.map(c => c.name)
+    : [...DEFAULT_CATEGORIES];
+
+  const t0 = Date.now();
+
+  // 3. Known provider → direct API (fast, accurate)
+  const provider = detectProvider(url);
+  if (provider) {
+    try {
+      const receipt = await fetchReceiptByUrl(url);
+      const invoiceData = receiptDataToInvoice(receipt, categories);
+      return NextResponse.json({
+        data: invoiceData,
+        url,
+        provider,
+        timings: { ocr: 0, llm: 0, total: Date.now() - t0 },
+        debug: { url, rawJson: receipt.rawJson },
+      });
+    } catch (err) {
+      // Provider API failed — fall through to generic HTML parsing
+      console.warn(`[parse-url] ${provider} API failed, falling back to HTML:`, err);
+    }
+  }
+
+  // 4. Generic HTML fallback
   let pageText: string;
+  let isSpa = !!provider; // known SPAs
   try {
-    pageText = await fetchReceiptPage(url);
+    const result = await fetchReceiptPage(url);
+    pageText = result.text;
+    isSpa = isSpa || result.isSpa;
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "שגיאה בטעינת הקישור" },
@@ -148,31 +190,25 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // 3. Parse
-  const userCategories = await prisma.category.findMany({
-    where: { userId: session.user.id },
-    select: { name: true },
-    orderBy: { name: "asc" },
-  });
-  const categories =
-    userCategories.length > 0
-      ? userCategories.map((c) => c.name)
-      : [...DEFAULT_CATEGORIES];
+  // 5. SPA detected → friendly error
+  if (isSpa || pageText.length < 50) {
+    const platformName = provider === "weezmo" ? "Weezmo" : provider === "pairzon" ? "Pairzon" : "האתר";
+    return NextResponse.json({
+      error: `הקישור מ-${platformName} לא ניתן לקריאה ישירה.`,
+      isSpa: true,
+      url,
+      suggestion: `צלם סקרינשוט של החשבונית ועלה אותו דרך טאב "סריקה".`,
+    }, { status: 422 });
+  }
 
-  const t0 = Date.now();
+  // 6. LLM parse from HTML text
   const prompt = buildParsePrompt(pageText, categories);
-  const { result: parsedInvoice, payload: llmPayload, ms: llmMs } =
-    await parseInvoiceWithLlm(prompt);
+  const { result: parsedInvoice, ms: llmMs } = await parseInvoiceWithLlm(prompt);
 
   return NextResponse.json({
     data: parsedInvoice,
     url,
     timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
-    debug: {
-      url,
-      prompt,
-      llmPayload: llmPayload as unknown as Record<string, unknown>,
-      ocrResponse: pageText.slice(0, 500) + "…",
-    },
+    debug: { url, prompt, ocrResponse: pageText.slice(0, 500) + "…" },
   });
 }
