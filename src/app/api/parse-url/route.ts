@@ -58,8 +58,8 @@ function htmlToText(html: string): string {
 //   Pass 2 — URL NOT preceded by a privacy/legal keyword
 //   Pass 3 — Last URL in text (receipt link usually comes after privacy link)
 //
-// NOTE: 'קבלה' intentionally excluded from Pass 1 — too generic.
-//       It appears in general SMS text ("הגיעה אליך קבלה") before the privacy URL.
+// The function also returns ALL detected URLs so the client can let the user
+// choose manually if the auto-detection was wrong.
 
 const RECEIPT_KEYWORDS_BEFORE =
   /לצפ|לצפיה|לצפייה|חשבונ|receipt|invoice|view/i;
@@ -67,36 +67,54 @@ const RECEIPT_KEYWORDS_BEFORE =
 const SKIP_KEYWORDS_BEFORE =
   /פרטי[וו]?ת|privacy|תקנון|terms|policy|legal|הסכם|תנאי|ביטול|cancel/i;
 
-function extractBestUrl(text: string): string | null {
+// URL path segments that strongly indicate a receipt (not privacy/terms)
+const RECEIPT_PATH_HINT = /\/r\/|\/receipt|\/notification|\/doc|\/cms/i;
+// URL path segments that strongly indicate privacy/terms pages
+const PRIVACY_PATH_HINT = /\/l\/|\/privacy|\/terms|\/policy|\/legal/i;
+
+function extractAllUrls(text: string): string[] {
   const matches = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
-  if (matches.length === 0) return null;
+  return matches.map(m => m[0].replace(/[.,;!?)\]]+$/, ""));
+}
 
-  const urls = matches.map(m => ({
-    url: m[0].replace(/[.,;!?)\]]+$/, ""),
-    index: m.index ?? 0,
-  }));
+function extractBestUrl(text: string): { best: string | null; all: string[] } {
+  const allUrls = extractAllUrls(text);
+  if (allUrls.length === 0) return { best: null, all: [] };
+  if (allUrls.length === 1) return { best: allUrls[0], all: allUrls };
 
-  if (urls.length === 1) return urls[0].url;
+  const urlsWithIndex = [...text.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)]
+    .map(m => ({ url: m[0].replace(/[.,;!?)\]]+$/, ""), index: m.index ?? 0 }));
+
+  // Pass 0: URL path itself contains a receipt hint AND no privacy hint
+  for (const { url } of urlsWithIndex) {
+    if (RECEIPT_PATH_HINT.test(url) && !PRIVACY_PATH_HINT.test(url)) {
+      return { best: url, all: allUrls };
+    }
+  }
 
   // Pass 1: receipt keyword nearby AND no skip keyword (strict)
-  for (const { url, index } of urls) {
+  for (const { url, index } of urlsWithIndex) {
     const before = text.slice(Math.max(0, index - 40), index);
-    if (RECEIPT_KEYWORDS_BEFORE.test(before) && !SKIP_KEYWORDS_BEFORE.test(before)) return url;
+    if (RECEIPT_KEYWORDS_BEFORE.test(before) && !SKIP_KEYWORDS_BEFORE.test(before)) {
+      return { best: url, all: allUrls };
+    }
   }
 
   // Pass 2: URL NOT preceded by a skip keyword (within 60 chars)
-  for (const { url, index } of urls) {
+  for (const { url, index } of urlsWithIndex) {
     const before = text.slice(Math.max(0, index - 60), index);
-    if (!SKIP_KEYWORDS_BEFORE.test(before)) return url;
+    if (!SKIP_KEYWORDS_BEFORE.test(before)) {
+      return { best: url, all: allUrls };
+    }
   }
 
   // Pass 3: last URL (receipt link usually comes after privacy link)
-  return urls[urls.length - 1].url;
+  return { best: allUrls[allUrls.length - 1], all: allUrls };
 }
 
-async function extractUrlFromText(text: string): Promise<string | null> {
-  const url = extractBestUrl(text);
-  if (url) return url;
+async function extractUrlFromText(text: string): Promise<{ url: string | null; allUrls: string[] }> {
+  const { best, all } = extractBestUrl(text);
+  if (best) return { url: best, allUrls: all };
 
   // LLM fallback (rare)
   const prompt = `הטקסט הבא מכיל קישור לחשבונית דיגיטלית. חלץ את ה-URL של החשבונית בלבד (לא קישורי מדיניות פרטיות).
@@ -112,12 +130,12 @@ async function extractUrlFromText(text: string): Promise<string | null> {
       options: { temperature: 0, num_predict: 100 },
     }),
   });
-  if (!res.ok) return null;
+  if (!res.ok) return { url: null, allUrls: all };
   try {
     const data = await res.json();
     const parsed = JSON.parse(data.response ?? "{}");
-    return parsed.url ?? null;
-  } catch { return null; }
+    return { url: parsed.url ?? null, allUrls: all };
+  } catch { return { url: null, allUrls: all }; }
 }
 
 // ── Fetch generic HTML page ───────────────────────────────────────────────────
@@ -177,14 +195,28 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   const body = await req.json().catch(() => null);
   const rawText: string = body?.text?.trim() ?? "";
+  // Allow client to override the auto-detected URL (user manual selection)
+  const overrideUrl: string | undefined = body?.overrideUrl?.trim() || undefined;
+
   if (!rawText)
     return NextResponse.json({ error: "לא התקבל טקסט" }, { status: 400 });
 
-  // 1. Extract URL (smart — prefers receipt link over privacy links)
-  const url = await extractUrlFromText(rawText);
+  // 1. Extract URL — use override if provided, otherwise auto-detect
+  let url: string | null;
+  let allUrls: string[] = [];
+
+  if (overrideUrl) {
+    url = overrideUrl;
+    allUrls = extractAllUrls(rawText);
+  } else {
+    const extracted = await extractUrlFromText(rawText);
+    url = extracted.url;
+    allUrls = extracted.allUrls;
+  }
+
   if (!url)
     return NextResponse.json(
-      { error: "לא נמצא קישור חשבונית בטקסט. ודא שהדבקת את המסרון המלא." },
+      { error: "לא נמצא קישור חשבונית בטקסט. ודא שהדבקת את המסרון המלא.", allUrls },
       { status: 422 }
     );
 
@@ -207,7 +239,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const receipt = await fetchReceiptByUrl(url);
       const invoiceData = receiptDataToInvoice(receipt, categories);
       return NextResponse.json({
-        data: invoiceData, url, provider,
+        data: invoiceData, url, provider, allUrls,
         timings: { ocr: 0, llm: 0, total: Date.now() - t0 },
         debug: { url, rawJson: receipt.rawJson },
       });
@@ -232,10 +264,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   // 5. SPA detected → friendly error
   if (isSpa || pageText.length < 50) {
-    const platformName = provider === "weezmo" ? "Weezmo" : provider === "pairzon" ? "Pairzon" : "האתר";
+    const platformName = provider === "weezmo" ? "Weezmo" : provider === "pairzon" ? "Pairzon" : provider === "ksp" ? "KSP" : "האתר";
     return NextResponse.json({
       error: `הקישור מ-${platformName} לא ניתן לקריאה ישירה.`,
-      isSpa: true, url,
+      isSpa: true, url, allUrls,
       suggestion: `צלם סקרינשוט של החשבונית ועלה אותו דרך טאב "סריקה".`,
     }, { status: 422 });
   }
@@ -245,7 +277,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const { result: parsedInvoice, ms: llmMs } = await parseInvoiceWithLlm(prompt);
 
   return NextResponse.json({
-    data: parsedInvoice, url,
+    data: parsedInvoice, url, allUrls,
     timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
     debug: { url, prompt, ocrResponse: pageText.slice(0, 500) + "…" },
   });

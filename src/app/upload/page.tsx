@@ -72,6 +72,9 @@ export default function UploadPage() {
   // Link state
   const [linkText, setLinkText] = useState("");
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
+  const [allDetectedUrls, setAllDetectedUrls] = useState<string[]>([]);
+  const [selectedUrl, setSelectedUrl] = useState<string | null>(null);
+  const [showUrlPicker, setShowUrlPicker] = useState(false);
 
   // Shared
   const [loading, setLoading] = useState(false);
@@ -99,8 +102,22 @@ export default function UploadPage() {
 
   // Detect URL in link text as user types
   useEffect(() => {
-    const match = linkText.match(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/);
-    setDetectedUrl(match ? match[0].replace(/[.,;!?)\]]+$/, "") : null);
+    const matches = [...linkText.matchAll(/https?:\/\/[^\s\u200B\u200C\u200D\uFEFF"'<>]+/g)];
+    const cleaned = matches.map(m => m[0].replace(/[.,;!?)\]]+$/, ""));
+    setAllDetectedUrls(cleaned);
+    // Reset manual selection when text changes
+    setSelectedUrl(null);
+    setShowUrlPicker(false);
+    if (cleaned.length === 0) {
+      setDetectedUrl(null);
+    } else if (cleaned.length === 1) {
+      setDetectedUrl(cleaned[0]);
+    } else {
+      // Pick the best heuristically (prefer /r/ or /notification/ paths)
+      const receiptHint = cleaned.find(u => /\/r\/|\/receipt|\/notification|\/doc|\/cms/i.test(u));
+      const nonPrivacy = cleaned.find(u => !/\/l\/|\/privacy|\/terms|\/policy/i.test(u));
+      setDetectedUrl(receiptHint ?? nonPrivacy ?? cleaned[cleaned.length - 1]);
+    }
   }, [linkText]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -144,12 +161,20 @@ export default function UploadPage() {
     setLoading(true);
     setParseStatus("מחפש קישור בטקסט ומפענח את החשבונית…");
     try {
+      const body: Record<string, string> = { text: linkText };
+      // If user manually selected a URL, send it as override
+      if (selectedUrl) body.overrideUrl = selectedUrl;
+
       const res = await fetch("/api/parse-url", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: linkText }),
+        body: JSON.stringify(body),
       });
       const result = await res.json();
+
+      // Update allUrls from server response too (server may find more)
+      if (result.allUrls?.length) setAllDetectedUrls(result.allUrls);
+
       if (!res.ok) throw new Error(result.error ?? "שגיאה בפענוח");
       setParseStatus("פענוח הצליח! אנא אשר את הנתונים:");
       setParsedData(result.data);
@@ -194,6 +219,7 @@ export default function UploadPage() {
 
   const handleReset = () => {
     setFile(null); setLinkText(""); setDetectedUrl(null);
+    setAllDetectedUrls([]); setSelectedUrl(null); setShowUrlPicker(false);
     setParsedData(null); setDebugData(null);
     setScanForm(EMPTY_MANUAL); setParseStatus("");
     setTimings(null); setPdfPath(undefined); setParseSource(undefined);
@@ -390,15 +416,59 @@ export default function UploadPage() {
                     </div>
 
                     {/* Detected URL preview */}
-                    {detectedUrl && (
-                      <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl p-3">
-                        <svg className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                        </svg>
-                        <div className="min-w-0">
-                          <p className="text-xs font-bold text-blue-700 mb-0.5">קישור זוהה ✓</p>
-                          <p className="text-xs text-blue-600 break-all font-mono">{detectedUrl}</p>
+                    {(detectedUrl || selectedUrl) && (
+                      <div className="space-y-2">
+                        <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl p-3">
+                          <svg className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                          </svg>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2 mb-0.5">
+                              <p className="text-xs font-bold text-blue-700">
+                                {selectedUrl ? "✓ קישור נבחר ידנית" : "קישור זוהה אוטומטית ✓"}
+                              </p>
+                              {allDetectedUrls.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setShowUrlPicker(!showUrlPicker)}
+                                  className="text-[11px] text-blue-500 hover:text-blue-700 font-semibold underline underline-offset-2 shrink-0"
+                                >
+                                  {showUrlPicker ? "סגור" : `זה לא נכון? (${allDetectedUrls.length} קישורים)`}
+                                </button>
+                              )}
+                            </div>
+                            <p className="text-xs text-blue-600 break-all font-mono">
+                              {selectedUrl ?? detectedUrl}
+                            </p>
+                          </div>
                         </div>
+
+                        {/* URL Picker dropdown */}
+                        {showUrlPicker && allDetectedUrls.length > 1 && (
+                          <div className="bg-white border border-blue-200 rounded-xl overflow-hidden shadow-sm animate-in fade-in duration-150">
+                            <p className="text-xs font-bold text-gray-500 px-3 pt-2.5 pb-1.5 border-b border-gray-100">
+                              בחר את הקישור הנכון:
+                            </p>
+                            {allDetectedUrls.map((u, i) => (
+                              <button
+                                key={i}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedUrl(u);
+                                  setShowUrlPicker(false);
+                                }}
+                                className={`w-full text-right px-3 py-2.5 text-xs font-mono break-all hover:bg-blue-50 transition border-b border-gray-50 last:border-0 flex items-start gap-2 ${
+                                  (selectedUrl ?? detectedUrl) === u ? "bg-blue-50 text-blue-700" : "text-gray-600"
+                                }`}
+                              >
+                                <span className="shrink-0 mt-0.5">
+                                  {(selectedUrl ?? detectedUrl) === u ? "✓" : "○"}
+                                </span>
+                                <span className="break-all">{u}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -418,7 +488,7 @@ export default function UploadPage() {
 
                     {/* Helper chips */}
                     <div className="flex flex-wrap gap-2 pt-1">
-                      {["Carrefour", "סופרפארם", "רמי לוי", "שופרסל", "wee.ai"].map(name => (
+                      {["Carrefour", "סופרפארם", "רמי לוי", "שופרסל", "KSP", "שילב", "wee.ai"].map(name => (
                         <span key={name} className="text-[11px] px-2 py-0.5 bg-gray-100 text-gray-500 rounded-full">{name}</span>
                       ))}
                       <span className="text-[11px] px-2 py-0.5 bg-gray-100 text-gray-400 rounded-full">+ כל שאר החנויות</span>

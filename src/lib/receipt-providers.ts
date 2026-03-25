@@ -8,6 +8,13 @@
  * Supported:
  *   - Weezmo  (wee.ai → receipts.weezmo.com)  — סופרפארם, רמי לוי, מקדונלד'ס ועוד
  *   - Pairzon (*.pairzon.com)                  — Carrefour, יינות ביתן, מגה ועוד
+ *   - KSP     (dsdoc.ksp.co.il/notification)   — קספ
+ *   - Shilav  (wee.ai → receipts.weezmo.com)   — שילב (uses Weezmo platform)
+ *
+ * Adding a new provider:
+ *   1. Add URL pattern to detectProvider()
+ *   2. Implement fetch{ProviderName}Receipt(url) returning ReceiptData
+ *   3. Add dispatch case in fetchReceiptByUrl()
  */
 
 export interface ReceiptItem {
@@ -18,7 +25,7 @@ export interface ReceiptItem {
 }
 
 export interface ReceiptData {
-  provider: "weezmo" | "pairzon" | "unknown";
+  provider: "weezmo" | "pairzon" | "ksp" | "unknown";
   total: number;
   date: string;           // ISO YYYY-MM-DD
   storeName: string;
@@ -29,9 +36,10 @@ export interface ReceiptData {
 
 // ── URL pattern matching ──────────────────────────────────────────────────────
 
-export function detectProvider(url: string): "weezmo" | "pairzon" | null {
+export function detectProvider(url: string): "weezmo" | "pairzon" | "ksp" | null {
   if (/wee\.ai|weezmo\.com/i.test(url)) return "weezmo";
   if (/pairzon\.com/i.test(url)) return "pairzon";
+  if (/dsdoc\.ksp\.co\.il/i.test(url)) return "ksp";
   return null;
 }
 
@@ -263,6 +271,87 @@ export async function fetchPairzonReceipt(url: string): Promise<ReceiptData> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// KSP adapter
+// Flow: dsdoc.ksp.co.il/notification/{TOKEN}
+//       → HTML page with embedded JSON or structured data
+//       → Parse total + items from HTML
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function fetchKspReceipt(url: string): Promise<ReceiptData> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15_000);
+  let html = "";
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": BROWSER_UA,
+        Accept: "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+      },
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} from KSP`);
+    html = await res.text();
+  } finally {
+    clearTimeout(t);
+  }
+
+  // Try to extract embedded JSON (KSP embeds receipt JSON in <script> tags)
+  const jsonMatch = html.match(/window\.__(?:RECEIPT|DATA|receipt|data)__\s*=\s*(\{[\s\S]*?\});/) ||
+                    html.match(/var\s+receiptData\s*=\s*(\{[\s\S]*?\});/) ||
+                    html.match(/<script[^>]*>\s*(\{"(?:total|amount|סכום)[^}]*\})\s*<\/script>/i);
+
+  if (jsonMatch) {
+    try {
+      const data = JSON.parse(jsonMatch[1]);
+      const total = parseFloat(data.total ?? data.amount ?? data.totalAmount ?? "0");
+      return {
+        provider: "ksp",
+        total,
+        date: parseIsoDate(data.date ?? data.createdDate),
+        storeName: data.storeName ?? data.store ?? "KSP",
+        storeAddress: data.storeAddress,
+        items: (data.items ?? []).map((i: { name: string; price: number; quantity?: number }) => ({
+          name: i.name, price: i.price, quantity: i.quantity,
+        })),
+        rawJson: data,
+      };
+    } catch { /* fall through to HTML parse */ }
+  }
+
+  // HTML parse fallback — extract total from visible text
+  const totalMatch = html.match(/סה[״"]כ[^₪\d]*₪?\s*([\d,]+\.?\d*)/i) ||
+                     html.match(/(?:total|סכום)[^₪\d]*₪?\s*([\d,]+\.?\d*)/i) ||
+                     html.match(/₪\s*([\d,]+\.?\d*)/);
+  const total = totalMatch ? parseFloat(totalMatch[1].replace(/,/g, "")) : 0;
+
+  const dateMatch = html.match(/(\d{2}[./\-]\d{2}[./\-]\d{2,4})/);
+  let dateStr = new Date().toISOString().split("T")[0];
+  if (dateMatch) {
+    try {
+      const parts = dateMatch[1].split(/[./\-]/);
+      // DD/MM/YYYY or DD/MM/YY
+      if (parts.length === 3) {
+        const year = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
+        dateStr = `${year}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`;
+      }
+    } catch { /* keep today */ }
+  }
+
+  if (total === 0) throw new Error("לא ניתן לחלץ סכום מחשבונית KSP");
+
+  return {
+    provider: "ksp",
+    total,
+    date: dateStr,
+    storeName: "KSP",
+    items: [],
+    rawJson: { htmlLength: html.length },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main entry: dispatch to correct provider
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -270,5 +359,6 @@ export async function fetchReceiptByUrl(url: string): Promise<ReceiptData> {
   const provider = detectProvider(url);
   if (provider === "weezmo") return fetchWeezmoReceipt(url);
   if (provider === "pairzon") return fetchPairzonReceipt(url);
+  if (provider === "ksp") return fetchKspReceipt(url);
   throw new Error(`ספק לא מזוהה: ${url}`);
 }
