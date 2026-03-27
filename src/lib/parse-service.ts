@@ -74,10 +74,12 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
       // The OCR service adds its own grayscale+sharpen pass.
       // Over-processing here causes double-sharpening artifacts that
       // destroy thin thermal-print text (receipts).
-      .normalize()                                // auto histogram stretch is enough
-
-      // ── Sharpen — mild, OCR service adds another pass ────────────────────
-      .sharpen({ sigma: 1.2 })                    // same as original working version
+      // ── Sharpen BEFORE normalize — original working order ─────────────
+      // sharpen first enhances subtle thermal-print edges,
+      // then normalize stretches the already-enhanced contrast.
+      // Reversing this order degrades Tesseract accuracy on thermal fonts.
+      .sharpen({ sigma: 1.2 })
+      .normalize()
 
       // ── Output ────────────────────────────────────────────────────────────
       .jpeg({ quality: 92 })
