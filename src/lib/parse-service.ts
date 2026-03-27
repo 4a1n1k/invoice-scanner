@@ -206,10 +206,55 @@ export function assessOcrQuality(text: string): OcrQuality {
   return { score, usable, warnings };
 }
 
+/**
+ * Detects RTL character-mirroring in OCR output.
+ * Happens with some receipt printers (e.g. MAX) where Tesseract reads
+ * each line char-by-char in reverse. Hebrew words appear reversed.
+ *
+ * "לתשלום" reversed char-by-char → "מולשתל"
+ * "חשבונית" reversed → "תינובשח"
+ */
+function isMirroredOcrText(text: string): boolean {
+  const MIRRORED_MARKERS = [
+    "מולשתל",  // לתשלום reversed
+    "תינובשח", // חשבונית reversed
+    "ךירואת",  // תאריך reversed
+    "יראת",    // partial
+  ];
+  const sample = text.slice(0, 600);
+  return MIRRORED_MARKERS.some(m => sample.includes(m));
+}
+
+/**
+ * Reverses each line char-by-char to fix RTL-mirrored OCR output.
+ * Numbers are re-reversed within each line to preserve digit order.
+ */
+function fixMirroredOcrText(text: string): string {
+  return text
+    .split("\n")
+    .map(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return "";
+      const rev = trimmed.split("").reverse().join("");
+      // Numbers got reversed too — fix digit sequences back
+      return rev.replace(/\d[\d.:,/\-]*\d|\d/g, m => m.split("").reverse().join(""));
+    })
+    .join("\n");
+}
+
 export function preprocessOcrText(raw: string): string {
   let text = raw;
+
+  // Fix RTL character-mirroring (e.g. MAX receipts)
+  if (isMirroredOcrText(text)) {
+    console.log("[OCR] detected RTL-mirrored text — applying char-level reversal");
+    text = fixMirroredOcrText(text);
+  }
+
+  // Israeli decimal comma fixes
   text = text.replace(/(\d),(\d{3})(?=\.\d|\D|$)/g, "$1$2");
   text = text.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
+  // Date normalization
   text = text.replace(/\b(\d{1,2})\.(\d{2})\.(\d{4})\b/g, "$1/$2/$3");
   return text;
 }

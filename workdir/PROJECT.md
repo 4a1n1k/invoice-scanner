@@ -174,9 +174,13 @@ repairAndParseJson()
 | PSM | 6 | Single block — receipts |
 | OEM | 1 | LSTM neural network |
 | Lang | heb+eng | Hebrew + English |
-| Sharp sigma | 1.2 | sharpen blurry mobile text |
+| Sharp sigma | **1.5** | חזק יותר — מפצה על מצלמות נייד |
+| m1/m2 | 0.5/1.0 | מגן אזורים אחידים, מחדד קצוות |
 | Normalize | ✅ | fix uneven lighting |
-| JPEG quality | 92 | less artifacts on small text |
+| Linear contrast | **1.2x** | חיזוק mid-tone — טקסט כהה על רקע אפור |
+| JPEG quality | **95** | פחות artifacts על אותיות קטנות |
+| 180° detection | ✅ | brightness comparison top vs bottom |
+| Watermark filter | ✅ | NOISE_PATTERNS מסנן ווטרמארקים |
 
 ---
 
@@ -241,5 +245,15 @@ ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
 - 8/8 unit tests passed על URL extraction
 - Live tests: שילב ✅, Sonol ✅, override ✅, auth ✅
 
+### Session 5 (מרץ 2026) — OCR Quality + Image fixes
+- **OCR Quality Gate** — `assessOcrQuality()`: score 0-100, checks gibberish/Hebrew ratio/PUA/digits
+- **OCR Quality Badge** ב-UI: `OCR ✓ 85` / `OCR ⚠ 55` / `OCR ✗ 20` + warning banner כשscore < 40
+- **180° Auto-Detection** — `detectUpsideDown()`: brightness comparison top vs bottom strip
+- **Preprocessing חזק יותר:** sigma 1.5, linear contrast boost (1.2x), quality 95, smart resize
+- **Watermark filter:** NOISE_PATTERNS מסנן שורות ווטרמארק (רמי לוי, שופרסל...)
+- **Prompt שיפור:** "לתשלום" > "סה"כ לתשלום", הוראה להתעלם מווטרמארק
+- **External API v1** מועלה לשרת עם API_KEY
+- **features.md + bugs.md** נוצרו לראשונה
+
 ---
-*עודכן לאחרונה: מרץ 2026 — Session 4*
+*עודכן לאחרונה: מרץ 2026 — Session 5*
