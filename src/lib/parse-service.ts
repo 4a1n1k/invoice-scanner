@@ -7,29 +7,97 @@ import { AI_CONFIG } from "./config";
 import type { ParsedInvoice } from "./types";
 
 // ─── Image pre-processing ─────────────────────────────────────────────────────
+
+/**
+ * Detects if image is rotated 180° by looking at pixel density:
+ * Receipts start with a header (dense text/logo at top).
+ * If top strip is lighter than bottom, image is likely upside down.
+ */
+async function detectUpsideDown(sharpInstance: ReturnType<typeof import("sharp")>): Promise<boolean> {
+  try {
+    // Sample top and bottom 10% of image — compare brightness
+    const { data, info } = await sharpInstance
+      .greyscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const w = info.width;
+    const h = info.height;
+    const strip = Math.floor(h * 0.12); // 12% top/bottom
+
+    let topSum = 0, bottomSum = 0;
+    for (let y = 0; y < strip; y++) {
+      for (let x = 0; x < w; x++) {
+        topSum += data[y * w + x];
+        bottomSum += data[(h - 1 - y) * w + x];
+      }
+    }
+    const topBrightness = topSum / (strip * w);
+    const bottomBrightness = bottomSum / (strip * w);
+
+    // If bottom is significantly darker than top → header is at bottom → upside down
+    // Threshold: bottom must be ≥8 points darker (0-255 scale)
+    const isUpsideDown = (topBrightness - bottomBrightness) > 8;
+    if (isUpsideDown) {
+      console.log(`[OCR] detected upside-down: top=${topBrightness.toFixed(1)} bottom=${bottomBrightness.toFixed(1)}`);
+    }
+    return isUpsideDown;
+  } catch {
+    return false;
+  }
+}
+
 async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
   const normalizedName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require("sharp");
     const inputBuffer = Buffer.from(await file.arrayBuffer());
+
+    // Step 1 — fix EXIF rotation first, then check if still upside-down
+    const afterExif = sharp(inputBuffer).rotate(); // fixes EXIF
+    const upsideDown = await detectUpsideDown(afterExif.clone());
+    const rotationAngle = upsideDown ? 180 : 0;
+
+    // Step 2 — get dimensions for resize strategy
+    const meta = await sharp(inputBuffer).rotate().metadata();
+    const w = meta.width ?? 1000;
+    const h = meta.height ?? 1000;
+    const isSmall = w < 800 || h < 800;
+    const targetWidth = isSmall ? 3000 : 2400;
+
     const outputBuffer: Buffer = await sharp(inputBuffer)
-      .rotate()                      // fix EXIF rotation — critical for mobile photos
-      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
-      .sharpen({ sigma: 1.2 })       // sharpen text edges — helps Tesseract on blurry phone photos
-      .normalize()                   // auto contrast stretch — fixes uneven lighting on receipts
-      .jpeg({ quality: 92 })         // higher quality → less JPEG blocking on small text
+      // ── Geometry ──────────────────────────────────────────────────────────
+      .rotate()                                   // fix EXIF
+      .rotate(rotationAngle)                      // fix manual 180° flip if needed
+      .resize({ width: targetWidth, height: targetWidth, fit: "inside", withoutEnlargement: false })
+
+      // ── Contrast & lighting ───────────────────────────────────────────────
+      .normalize()                                // auto histogram stretch
+
+      // ── Sharpen ───────────────────────────────────────────────────────────
+      .sharpen({ sigma: 1.5, m1: 0.5, m2: 1.0 })
+
+      // ── Contrast boost for watermarked / grey receipts ────────────────────
+      // linear(a, b): output = a * input + b
+      // 1.2 boost makes dark receipt text on grey background pop
+      .linear(1.2, -(128 * 0.2))
+
+      // ── Output ────────────────────────────────────────────────────────────
+      .jpeg({ quality: 95 })
       .toBuffer();
+
     const plainArrayBuffer = outputBuffer.buffer.slice(
       outputBuffer.byteOffset,
       outputBuffer.byteOffset + outputBuffer.byteLength
     );
+    console.log(`[OCR] preprocessed: ${w}x${h} → ${targetWidth}px, rot=${rotationAngle}°, ${Math.round(outputBuffer.length / 1024)}KB`);
     return {
       blob: new Blob([plainArrayBuffer as ArrayBuffer], { type: "image/jpeg" }),
       filename: normalizedName,
     };
-  } catch {
-    console.warn("[OCR] sharp preprocessing failed, using original file");
+  } catch (err) {
+    console.warn("[OCR] sharp preprocessing failed, using original file:", err);
     return { blob: file, filename: file.name };
   }
 }
@@ -62,7 +130,81 @@ export async function extractTextViaOcr(file: File): Promise<{ text: string; ms:
   }
 }
 
-// ─── Text pre-processing ──────────────────────────────────────────────────────
+// ─── OCR quality gate ─────────────────────────────────────────────────────────
+// Checks if OCR output is usable before sending to LLM.
+// Returns a quality score 0-100 and a list of warnings.
+
+export interface OcrQuality {
+  score: number;          // 0 (gibberish) → 100 (clean)
+  usable: boolean;        // score >= 40
+  warnings: string[];
+}
+
+export function assessOcrQuality(text: string): OcrQuality {
+  const warnings: string[] = [];
+
+  if (!text || text.trim().length === 0) {
+    return { score: 0, usable: false, warnings: ["OCR returned empty text"] };
+  }
+
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  const chars = text.replace(/\s/g, "");
+  const totalChars = chars.length;
+
+  if (totalChars < 20) {
+    return { score: 5, usable: false, warnings: [`Very short OCR output: ${totalChars} chars`] };
+  }
+
+  let score = 100;
+
+  // ── Check 1: gibberish ratio (non-printable / replacement chars) ──────────
+  const gibberishChars = (text.match(/[\uFFFD\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) ?? []).length;
+  const gibberishRatio = gibberishChars / totalChars;
+  if (gibberishRatio > 0.05) {
+    score -= 40;
+    warnings.push(`High gibberish ratio: ${(gibberishRatio * 100).toFixed(0)}%`);
+  }
+
+  // ── Check 2: Hebrew/Latin/digit ratio (receipt must have some real text) ──
+  const hebrewChars = (chars.match(/[\u05d0-\u05ea]/g) ?? []).length;
+  const latinChars  = (chars.match(/[a-zA-Z]/g) ?? []).length;
+  const digitChars  = (chars.match(/\d/g) ?? []).length;
+  const meaningfulRatio = (hebrewChars + latinChars + digitChars) / totalChars;
+
+  if (meaningfulRatio < 0.3) {
+    score -= 35;
+    warnings.push(`Low meaningful content: ${(meaningfulRatio * 100).toFixed(0)}% (heb+lat+dig)`);
+  }
+
+  // ── Check 3: must have at least one number (every receipt has prices) ─────
+  if (digitChars < 3) {
+    score -= 25;
+    warnings.push("Almost no digits — likely OCR failure");
+  }
+
+  // ── Check 4: line structure — receipts have multiple lines ───────────────
+  if (lines.length < 3) {
+    score -= 15;
+    warnings.push(`Very few lines: ${lines.length}`);
+  }
+
+  // ── Check 5: PUA chars (garbled custom fonts) ────────────────────────────
+  const puaChars = (text.match(/[\uE000-\uF8FF]/g) ?? []).length;
+  const puaRatio  = puaChars / totalChars;
+  if (puaRatio > 0.1) {
+    score -= 30;
+    warnings.push(`High PUA ratio: ${(puaRatio * 100).toFixed(0)}% — garbled font`);
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  const usable = score >= 40;
+
+  if (!usable) {
+    warnings.push(`OCR quality too low (score=${score}) — result may be inaccurate`);
+  }
+
+  return { score, usable, warnings };
+}
 
 export function preprocessOcrText(raw: string): string {
   let text = raw;
@@ -78,6 +220,9 @@ const NOISE_PATTERNS = [
   /מסמך ממוחשב/, /מסמך זה הינו/, /page \d+ of \d+/i,
   /weezmo/i, /info@weezmo/i, /חתימה אלקטרונית/,
   /הוראות ניהול ספרים/, /verified by/i,
+  // Watermark patterns — large branding overlaid on receipt
+  /^רמי\s*לוי$/i, /^שופרסל$/i, /^סופר.פארם$/i, /^מקס\s*סטוק$/i,
+  /^carrefour$/i, /^victory$/i,
 ];
 
 export function extractBusinessName(ocrText: string): string {
@@ -185,20 +330,22 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
 קטגוריות: ${catLines}
 
 חוקים:
-- amount: הסכום הסופי כולל מע"מ, כמספר בלבד, ללא ₪:
-  * חפש בסדר עדיפות: "סה"כ לתשלום" > "לתשלום" > "סה"כ קנייה" > "Grand Total" > "סה"כ"
-  * אם יש כמה שורות סה"כ — קח תמיד את הגדול ביותר (הוא הסכום עם מע"מ)
-  * אל תיקח: "סה"כ ללא מע"מ", מחיר ליחידה, מע"מ בנפרד
+- amount: הסכום הסופי כולל מע"מ, כמספר בלבד, ללא ₪ וללא פסיקים:
+  * חפש בסדר עדיפות: "לתשלום" > "סה"כ לתשלום" > "סה"כ קנייה" > "Grand Total" > "סה"כ"
+  * אם מופיעות כמה שורות "סה"כ" — קח תמיד את הגדולה ביותר (הסכום הכולל עם מע"מ)
+  * אל תיקח: "סה"כ ללא מע"מ", מחיר ליחידה, מע"מ בנפרד, סכומי ביניים
+  * הסכום חייב להיות מספר חיובי. אם אתה רואה מספרים כמו 232.61 — זה הסכום הנכון
 - date: DD/MM/YYYY → YYYY-MM-DD. אחרת: ${today}
 - type: בחר קטגוריה לפי שם העסק והפריטים
-- description: שם העסק בלבד, כפי שמופיע בחשבונית — המלא והמדויק, 3-6 מילים
-  * דוגמאות: "סופר-פארם מעלות", "חברת החשמל לישראל", "63 קיי אס פי מחשבים אילת"
-  * אל תוסיף "—" ואל תוסיף מה נרכש — רק שם העסק
+- description: שם העסק בדיוק כפי שמופיע בחשבונית — המלא והמדויק
+  * דוגמאות טובות: "שופרסל בע״מ", "סופר-פארם מעלות", "מזרוו בכפר 23 בע״מ", "מקס סטוק"
+  * אם מופיע ווטרמארק גדול בתמונה — התעלם ממנו, שם העסק הוא הכיתוב הקטן בראש הדף
+  * אל תוסיף את מה שנרכש — רק שם העסק
 
-החזר JSON בלבד:
+החזר JSON בלבד, ללא טקסט נוסף:
 {"amount":<number>,"date":"<YYYY-MM-DD>","type":"<category>","description":"<שם עסק>"}
 
-טקסט:
+טקסט החשבונית:
 ${relevantText}`;
 }
 
@@ -313,15 +460,26 @@ export interface PipelineResult {
   prompt: string;
   llmPayload: LlmPayload;
   timings: { ocr: number; llm: number; total: number };
+  ocrQuality: OcrQuality;
 }
 
 export async function runParsingPipeline(file: File, categories: string[]): Promise<PipelineResult> {
   const t0 = Date.now();
   const { text: ocrText, ms: ocrMs } = await extractTextViaOcr(file);
+
+  // Quality gate — log warnings, continue anyway but surface score to client
+  const quality = assessOcrQuality(ocrText);
+  if (quality.warnings.length > 0) {
+    console.warn(`[OCR] quality=${quality.score}/100 usable=${quality.usable}`, quality.warnings);
+  } else {
+    console.log(`[OCR] quality=${quality.score}/100 ✓`);
+  }
+
   const prompt = buildParsePrompt(ocrText, categories);
   const { result: parsedInvoice, payload: llmPayload, ms: llmMs } = await parseInvoiceWithLlm(prompt);
   return {
     parsedInvoice, ocrText, prompt, llmPayload,
     timings: { ocr: ocrMs, llm: llmMs, total: Date.now() - t0 },
+    ocrQuality: quality,
   };
 }

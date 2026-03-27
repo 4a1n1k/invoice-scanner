@@ -21,7 +21,7 @@
 | DB | Prisma + SQLite |
 | Auth | NextAuth v5 (credentials) |
 | OCR | Tesseract (node-tesseract-ocr, PSM 6, heb+eng) |
-| LLM | Ollama local — **qwen2.5:3b** (החלפה מ-gemma3:4b) |
+| LLM | Ollama local — **qwen2.5:3b** |
 | Image processing | sharp |
 | PDF processing | pdf-parse + pdf2pic + ghostscript |
 
@@ -49,15 +49,8 @@
 |------|------|--------|-----------|
 | `qwen2.5:3b` | 1.9GB | ✅ **פעיל** | ~6-12 שניות |
 | `gemma3:4b` | 3.3GB | ⚠️ installed (backup) | ~35-50 שניות |
-| `smollm2:135m` | 270MB | ❌ **נמחק** | — |
+| `smollm2:135m` | 270MB | ❌ נמחק | — |
 
-**למה qwen2.5:3b עדיף:**
-- מצוין לעברית (Alibaba multilingual training)
-- 1.9GB במקום 3.3GB → פחות לחץ על swap
-- ~21 tokens/sec vs ~8 tokens/sec של gemma3
-- benchmark: 5.8s vs 35-50s (!!)
-
----
 
 ## Project Structure
 
@@ -65,7 +58,7 @@
 src/
 ├── app/
 │   ├── page.tsx                    — Dashboard (server component)
-│   ├── upload/page.tsx             — Upload + manual entry (2-tab mode)
+│   ├── upload/page.tsx             — Upload + SMS/URL + manual entry
 │   ├── settings/page.tsx           — Category management
 │   ├── reports/page.tsx            — Reports page
 │   └── api/
@@ -77,9 +70,11 @@ src/
 │       ├── invoices/route.ts       — POST invoice
 │       ├── invoices/[id]/route.ts  — PATCH/DELETE invoice
 │       ├── parse/route.ts          — OCR+LLM pipeline (user-facing)
-│       ├── internal/parse/route.ts — Internal API (machine-to-machine) ← אל תגע!
+│       ├── parse-url/route.ts      — SMS/URL parsing (user-facing)
+│       ├── internal/parse/route.ts — Internal API (home-manager) ← אל תגע!
+│       ├── v1/receipt/route.ts     — External API (n8n, bots, services)
 │       └── reports/
-│           ├── data/route.ts       — GET invoices by month
+│           ├── data/route.ts
 │           ├── export/route.ts     — Excel export
 │           ├── pdf/route.ts        — HTML print-ready report
 │           └── download-zip/route.ts
@@ -90,6 +85,7 @@ src/
     ├── config.ts                   — AI_CONFIG, STORAGE_CONFIG, DEFAULT_CATEGORIES
     ├── types.ts                    — InvoiceDTO, CategoryDTO, ParsedInvoice
     ├── parse-service.ts            — Full OCR+LLM pipeline
+    ├── receipt-providers.ts        — Weezmo / Pairzon / KSP adapters
     └── prisma.ts
 ```
 
@@ -103,34 +99,43 @@ src/
 ```json
 {
   "success": true,
-  "data": { "amount": 248.7, "date": "2026-02-23", "type": "מזון", "description": "סופר-פארם מעלות" },
+  "data": { "amount": 248.7, "date": "2026-02-23", "type": "מזון", "description": "סופר-פארם" },
   "timings": { "ocr": 1900, "llm": 5800, "total": 7700 }
 }
 ```
-**INTERNAL_API_KEY=6fb6447f6e5f461b86dca1abb68cdc66** (ב-.env בשרת)
-**שימוש:** home-manager שולח קובץ ומקבל נתוני חשבונית — אל תגע בendpoint הזה!
+**INTERNAL_API_KEY = 6fb6447f6e5f461b86dca1abb68cdc66** (ב-.env בשרת)
 
 ---
 
-## Deployment
+## External API v1
 
-```bash
-# Deploy update:
-cd D:\Projects\Antigravity\invoice-scanner
-git add -A && git commit -m "message" && git push origin main
+**Endpoint:** `POST /api/v1/receipt`
+**Auth:** `Authorization: Bearer 6fb6447f6e5f461b86dca1abb68cdc66`
+**מתועד ב:** `invoice-scanner-api.md`
 
-# On server (rebuild):
-ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && git pull && docker compose down && docker compose build --no-cache && docker compose up -d"
+מקבל:
+- `{ "text": "SMS / URL" }` — JSON
+- `{ "text": "...", "overrideUrl": "https://..." }` — עם override
+- `file=@receipt.jpg` — multipart
 
-# Quick restart (no rebuild):
-ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && docker compose down && docker compose up -d"
+מחזיר: `{ ok, source, url, allUrls, invoice: { amount, date, description, type, items }, timings }`
 
-# Health check:
-curl http://116.203.149.15:3005/api/health
 
-# Logs:
-ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
-```
+## Receipt Providers (receipt-providers.ts)
+
+| ספק | Pattern | שיטה |
+|-----|---------|-------|
+| Weezmo | `wee.ai`, `weezmo.com` | JSON API ישיר |
+| Pairzon | `*.pairzon.com` | JSON API ישיר |
+| KSP | `dsdoc.ksp.co.il` | HTML parse + regex fallback |
+| שילב | `wee.ai/r/...` | Weezmo (אוטומטי) |
+| כל שאר | כל URL | HTML → LLM |
+
+**URL extraction (extractBestUrl):**
+- Pass 0 — path hint: `/r/`, `/notification/`, `/cms/` → receipt; `/l/`, `/privacy/` → skip
+- Pass 1 — מילת מפתח לפני URL (לצפי, חשבונ...)
+- Pass 2 — URL ללא privacy keyword
+- Pass 3 — last URL (fallback)
 
 ---
 
@@ -149,7 +154,7 @@ preprocessOcrText() — decimal comma fix + date normalization
         ↓
 extractBusinessName() — server-side, before LLM
         ↓
-extractInvoiceContext() — HEAD(400) + expanding window search (25%→50%→75%→100%)
+extractInvoiceContext() — HEAD(400) + expanding window (25%→50%→75%→100%)
         ↓
 buildParsePrompt() — ~500-700 chars focused prompt
         ↓
@@ -157,7 +162,7 @@ LLM (Ollama qwen2.5:3b, temperature=0, num_predict=200)
         ↓
 repairAndParseJson()
         ↓
-{amount, date, type, description}
+{ amount, date, type, description }
 ```
 
 ---
@@ -186,6 +191,23 @@ repairAndParseJson()
 | `LLM_MODEL` | `qwen2.5:3b` | מודל LLM |
 | `AI_TIMEOUT_MS` | `55000` | timeout |
 | `INTERNAL_API_KEY` | — | מפתח לendpoint פנימי |
+| `API_KEY` | — | מפתח ל-/api/v1/receipt |
+
+
+## Deployment
+
+```bash
+# Push + deploy (standard):
+cd D:\Projects\Antigravity\invoice-scanner
+git add -A && git commit -m "message" && git push origin main
+ssh -p 2299 root@116.203.149.15 "cd /opt/invoice-scanner && git pull && docker compose build --no-cache && docker compose up -d"
+
+# Health check:
+curl http://116.203.149.15:3005/api/health
+
+# Logs:
+ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
+```
 
 ---
 
@@ -205,10 +227,19 @@ repairAndParseJson()
 
 ### Session 3 (מרץ 2026) — Internal API + LLM upgrade
 - נוסף `POST /api/internal/parse` לintegration עם home-manager
-- **החלפת LLM: gemma3:4b → qwen2.5:3b**
-- מחיקת smollm2:135m (לא בשימוש)
-- ביצועים: 35-50s → **~6-12s** ✅
-- docker-compose.yml: default LLM_MODEL עודכן ל-qwen2.5:3b
+- החלפת LLM: gemma3:4b → **qwen2.5:3b** (35-50s → 6-12s)
+- מחיקת smollm2:135m
+
+### Session 4 (מרץ 2026) — SMS/URL parsing + providers
+- נוסף טאב "קישור / מסרון" ב-upload page
+- `POST /api/parse-url` — חילוץ URL חכם מ-SMS
+- receipt-providers.ts — Weezmo + Pairzon adapters (JSON API ישיר)
+- KSP adapter (dsdoc.ksp.co.il) — HTML parse
+- URL extraction: Pass 0-3 algorithm (path hints + keyword matching)
+- URL Picker UI — כשיש מספר קישורים, המשתמש יכול לבחור ידנית
+- `POST /api/v1/receipt` — External unified API (Bearer auth)
+- 8/8 unit tests passed על URL extraction
+- Live tests: שילב ✅, Sonol ✅, override ✅, auth ✅
 
 ---
-*עודכן לאחרונה: מרץ 2026 — Session 3*
+*עודכן לאחרונה: מרץ 2026 — Session 4*

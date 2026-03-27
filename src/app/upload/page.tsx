@@ -20,11 +20,33 @@ interface ParseTimings {
   total: number;
 }
 
+interface OcrQuality {
+  score: number;
+  usable: boolean;
+  warnings: string[];
+}
+
 const TODAY = new Date().toISOString().split("T")[0];
 const EMPTY_MANUAL: ManualFormState = { amount: "", date: TODAY, type: "", description: "" };
 
-function TimingBadge({ timings, pdfPath, source }: { timings: ParseTimings; pdfPath?: string; source?: string }) {
+function TimingBadge({ timings, pdfPath, source, ocrQuality }: {
+  timings: ParseTimings;
+  pdfPath?: string;
+  source?: string;
+  ocrQuality?: OcrQuality;
+}) {
   const fmt = (ms: number) => ms >= 1000 ? `${(ms / 1000).toFixed(1)}ש` : `${ms}ms`;
+
+  const qScore = ocrQuality?.score ?? null;
+  const qColor = qScore === null ? "" :
+    qScore >= 75 ? "bg-emerald-50 text-emerald-600" :
+    qScore >= 40 ? "bg-amber-50 text-amber-600" :
+                   "bg-red-50 text-red-600";
+  const qLabel = qScore === null ? null :
+    qScore >= 75 ? `OCR ✓ ${qScore}` :
+    qScore >= 40 ? `OCR ⚠ ${qScore}` :
+                   `OCR ✗ ${qScore}`;
+
   return (
     <div className="flex items-center gap-3 text-[10px] text-gray-400 font-mono pt-1">
       {timings.ocr > 0 && (
@@ -58,6 +80,12 @@ function TimingBadge({ timings, pdfPath, source }: { timings: ParseTimings; pdfP
           </span>
         </>
       )}
+      {qLabel && (
+        <span title={ocrQuality?.warnings?.join(" | ")}
+          className={`px-1.5 py-0.5 rounded text-[9px] font-bold cursor-help ${qColor}`}>
+          {qLabel}
+        </span>
+      )}
     </div>
   );
 }
@@ -85,6 +113,7 @@ export default function UploadPage() {
   const [timings, setTimings] = useState<ParseTimings | null>(null);
   const [pdfPath, setPdfPath] = useState<string | undefined>(undefined);
   const [parseSource, setParseSource] = useState<string | undefined>(undefined);
+  const [ocrQuality, setOcrQuality] = useState<OcrQuality | undefined>(undefined);
   const [showDebug, setShowDebug] = useState(false);
   const [scanForm, setScanForm] = useState<ManualFormState>(EMPTY_MANUAL);
   const [manualForm, setManualForm] = useState<ManualFormState>(EMPTY_MANUAL);
@@ -142,6 +171,7 @@ export default function UploadPage() {
       setTimings(result.timings ?? null);
       setPdfPath(result.debug?.pdfPath);
       setParseSource(undefined);
+      setOcrQuality(result.ocrQuality ?? undefined);
       setScanForm({
         amount: result.data?.amount?.toString() ?? "",
         date: result.data?.date ?? TODAY,
@@ -222,7 +252,7 @@ export default function UploadPage() {
     setAllDetectedUrls([]); setSelectedUrl(null); setShowUrlPicker(false);
     setParsedData(null); setDebugData(null);
     setScanForm(EMPTY_MANUAL); setParseStatus("");
-    setTimings(null); setPdfPath(undefined); setParseSource(undefined);
+    setTimings(null); setPdfPath(undefined); setParseSource(undefined); setOcrQuality(undefined);
   };
 
   const renderFormFields = (form: ManualFormState, setForm: (f: ManualFormState) => void) => (
@@ -294,8 +324,17 @@ export default function UploadPage() {
     <form onSubmit={e => handleSave(e, scanForm)} className="space-y-5 animate-in fade-in duration-300">
       <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-green-800 text-sm font-medium flex items-center justify-between gap-2 flex-wrap">
         <span>✅ {parseStatus}</span>
-        {timings && <TimingBadge timings={timings} pdfPath={pdfPath} source={parseSource} />}
+        {timings && <TimingBadge timings={timings} pdfPath={pdfPath} source={parseSource} ocrQuality={ocrQuality} />}
       </div>
+      {ocrQuality && !ocrQuality.usable && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-amber-800 text-xs space-y-1">
+          <p className="font-bold">⚠️ איכות OCR נמוכה — הנתונים עשויים להיות לא מדויקים</p>
+          <p>נסה לצלם מחדש עם תאורה טובה יותר, מזווית ישרה וקרוב יותר לחשבונית.</p>
+          {ocrQuality.warnings.map((w, i) => (
+            <p key={i} className="text-[11px] text-amber-600 font-mono">{w}</p>
+          ))}
+        </div>
+      )}
       {renderFormFields(scanForm, setScanForm)}
       <div className="flex gap-3 pt-2">
         <button type="submit" disabled={loading}

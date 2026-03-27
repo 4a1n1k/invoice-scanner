@@ -150,9 +150,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const imageBlob = await pdfPageToImageBlob(pdfBuffer);
       if (imageBlob) {
         const imageFile = new File([imageBlob], "pdf_page.jpg", { type: "image/jpeg" });
-        const { parsedInvoice, ocrText, prompt, llmPayload, timings } = await runParsingPipeline(imageFile, categories);
+        const { parsedInvoice, ocrText, prompt, llmPayload, timings, ocrQuality } = await runParsingPipeline(imageFile, categories);
         return NextResponse.json({
           data: parsedInvoice, ocrText, timings,
+          ocrQuality,
           debug: { pdfPath: "ocr-fallback", prompt, llmPayload: llmPayload as unknown as Record<string, unknown>, ocrResponse: ocrText.substring(0, 500) + "…" },
         });
       }
@@ -164,9 +165,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     // ── Image ────────────────────────────────────────────────────────────────
-    const { parsedInvoice, ocrText, prompt, llmPayload, timings } = await runParsingPipeline(file, categories);
+    const { parsedInvoice, ocrText, prompt, llmPayload, timings, ocrQuality } = await runParsingPipeline(file, categories);
     return NextResponse.json({
       data: parsedInvoice, ocrText, timings,
+      ocrQuality,
       debug: { prompt, llmPayload: llmPayload as unknown as Record<string, unknown>, ocrResponse: ocrText.substring(0, 500) + "…" },
     });
 
