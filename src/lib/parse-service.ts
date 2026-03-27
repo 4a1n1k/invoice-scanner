@@ -59,39 +59,35 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
     const upsideDown = await detectUpsideDown(afterExif.clone());
     const rotationAngle = upsideDown ? 180 : 0;
 
-    // Step 2 — get dimensions for resize strategy
+    // Step 2 — get dimensions for log only
     const meta = await sharp(inputBuffer).rotate().metadata();
     const w = meta.width ?? 1000;
     const h = meta.height ?? 1000;
-    const isSmall = w < 800 || h < 800;
-    const targetWidth = isSmall ? 3000 : 2400;
 
     const outputBuffer: Buffer = await sharp(inputBuffer)
       // ── Geometry ──────────────────────────────────────────────────────────
-      .rotate()                                   // fix EXIF
-      .rotate(rotationAngle)                      // fix manual 180° flip if needed
-      .resize({ width: targetWidth, height: targetWidth, fit: "inside", withoutEnlargement: false })
+      .rotate()                                   // fix EXIF rotation
+      .rotate(rotationAngle)                      // fix manual 180° flip if detected
+      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
 
-      // ── Contrast & lighting ───────────────────────────────────────────────
-      .normalize()                                // auto histogram stretch
+      // ── Contrast — normalize only, NO linear boost ────────────────────────
+      // The OCR service adds its own grayscale+sharpen pass.
+      // Over-processing here causes double-sharpening artifacts that
+      // destroy thin thermal-print text (receipts).
+      .normalize()                                // auto histogram stretch is enough
 
-      // ── Sharpen ───────────────────────────────────────────────────────────
-      .sharpen({ sigma: 1.5, m1: 0.5, m2: 1.0 })
-
-      // ── Contrast boost for watermarked / grey receipts ────────────────────
-      // linear(a, b): output = a * input + b
-      // 1.2 boost makes dark receipt text on grey background pop
-      .linear(1.2, -(128 * 0.2))
+      // ── Sharpen — mild, OCR service adds another pass ────────────────────
+      .sharpen({ sigma: 1.2 })                    // same as original working version
 
       // ── Output ────────────────────────────────────────────────────────────
-      .jpeg({ quality: 95 })
+      .jpeg({ quality: 92 })
       .toBuffer();
 
     const plainArrayBuffer = outputBuffer.buffer.slice(
       outputBuffer.byteOffset,
       outputBuffer.byteOffset + outputBuffer.byteLength
     );
-    console.log(`[OCR] preprocessed: ${w}x${h} → ${targetWidth}px, rot=${rotationAngle}°, ${Math.round(outputBuffer.length / 1024)}KB`);
+    console.log(`[OCR] preprocessed: ${w}x${h} → 2400px, rot=${rotationAngle}°, ${Math.round(outputBuffer.length / 1024)}KB`);
     return {
       blob: new Blob([plainArrayBuffer as ArrayBuffer], { type: "image/jpeg" }),
       filename: normalizedName,
