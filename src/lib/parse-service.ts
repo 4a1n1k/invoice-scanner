@@ -51,48 +51,11 @@ async function detectUpsideDown(sharpInstance: ReturnType<typeof import("sharp")
 }
 
 async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
-  const normalizedName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const sharp = require("sharp");
-    const inputBuffer = Buffer.from(await file.arrayBuffer());
-
-    // Step 1 — fix EXIF rotation first, then check if still upside-down
-    const afterExif = sharp(inputBuffer).rotate(); // fixes EXIF
-    const upsideDown = await detectUpsideDown(afterExif.clone());
-    const rotationAngle = upsideDown ? 180 : 0;
-
-    // Step 2 — get dimensions for log only
-    const meta = await sharp(inputBuffer).rotate().metadata();
-    const w = meta.width ?? 1000;
-    const h = meta.height ?? 1000;
-
-    const outputBuffer: Buffer = await sharp(inputBuffer)
-      // ── Geometry ──────────────────────────────────────────────────────────
-      .rotate()                                   // fix EXIF rotation
-      .rotate(rotationAngle)                      // fix manual 180° flip if detected
-      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
-
-      // IMPORTANT: The OCR service (/ocr/file) already applies grayscale + sharpen.
-      // We only rotate + resize here to avoid double-processing artifacts.
-
-      // ── Output ────────────────────────────────────────────────────────────
-      .jpeg({ quality: 92 })
-      .toBuffer();
-
-    const plainArrayBuffer = outputBuffer.buffer.slice(
-      outputBuffer.byteOffset,
-      outputBuffer.byteOffset + outputBuffer.byteLength
-    );
-    console.log(`[OCR] preprocessed: ${w}x${h} → 2400px, rot=${rotationAngle}°, ${Math.round(outputBuffer.length / 1024)}KB`);
-    return {
-      blob: new Blob([plainArrayBuffer as ArrayBuffer], { type: "image/jpeg" }),
-      filename: normalizedName,
-    };
-  } catch (err) {
-    console.warn("[OCR] sharp preprocessing failed, using original file:", err);
-    return { blob: file, filename: file.name };
-  }
+  // No preprocessing — send original file directly to OCR service.
+  // The OCR service already applies grayscale + sharpen internally.
+  // All preprocessing attempts caused regressions.
+  console.log(`[OCR] sending original: ${file.name}, ${Math.round(file.size / 1024)}KB`);
+  return { blob: file, filename: file.name };
 }
 
 // ─── OCR ─────────────────────────────────────────────────────────────────────
@@ -419,7 +382,6 @@ export function buildParsePrompt(rawOcrText: string, categories: string[]): stri
   * אל תיקח: "סה"כ ללא מע"מ", מחיר ליחידה, מע"מ בנפרד, סכומי ביניים
   * אם הטקסט מקולקל ואין מילות מפתח ברורות — קח את המספר העשרוני הגדול ביותר בטקסט (הוא כמעט תמיד הסכום הכולל)
   * הסכום חייב להיות מספר חיובי. אם אתה רואה מספרים כמו 232.61 או 310.50 — זה הסכום הנכון
-- date: DD/MM/YYYY → YYYY-MM-DD. חפש תאריך בכל הטקסט — גם אם מופיע עם שעה (כמו 15/03/2026 20:11:19). אחרת: ${today}
 - type: בחר קטגוריה לפי שם העסק והפריטים
 - description: שם העסק בדיוק כפי שמופיע בחשבונית — המלא והמדויק
   * דוגמאות טובות: "שופרסל בע״מ", "סופר-פארם מעלות", "מזרוו בכפר 23 בע״מ", "מקס סטוק"
