@@ -35,9 +35,12 @@ async function detectUpsideDown(sharpInstance: ReturnType<typeof import("sharp")
     const topBrightness = topSum / (strip * w);
     const bottomBrightness = bottomSum / (strip * w);
 
-    // If bottom is significantly darker than top → header is at bottom → upside down
-    // Threshold: bottom must be ≥8 points darker (0-255 scale)
-    const isUpsideDown = (topBrightness - bottomBrightness) > 8;
+    // If bottom is significantly darker than top → header is at bottom → upside down.
+    // Threshold calibration (0-255 brightness scale):
+    //   - Real upside-down (Shufersol flipped): top≈170, bottom≈86  → diff≈84 ✅
+    //   - False positive  (Mirzav correct):     top≈232, bottom≈174 → diff≈58 ❌
+    // Using threshold of 70: catches real flips (≥70) but ignores normal contrast (≤60).
+    const isUpsideDown = (topBrightness - bottomBrightness) > 70;
     if (isUpsideDown) {
       console.log(`[OCR] detected upside-down: top=${topBrightness.toFixed(1)} bottom=${bottomBrightness.toFixed(1)}`);
     }
