@@ -81,7 +81,7 @@ async function callGeminiApi(parts: GeminiPart[]): Promise<string> {
     contents: [{ parts }],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 8192,
+      maxOutputTokens: 16384, // supports up to ~150 line items per receipt
       responseMimeType: "application/json",
     },
   };

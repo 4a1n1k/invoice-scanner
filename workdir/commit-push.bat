@@ -1,6 +1,6 @@
 @echo off
 cd /d D:\Projects\Antigravity\invoice-scanner
 git add -A
-git commit -m "fix: increase Gemini maxOutputTokens to 8192 + repair truncated JSON response"
+git commit -m "fix: increase maxOutputTokens to 16384 for large receipts with 150+ items"
 git push origin main
 echo DONE
