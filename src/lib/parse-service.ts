@@ -51,11 +51,31 @@ async function detectUpsideDown(sharpInstance: ReturnType<typeof import("sharp")
 }
 
 async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename: string }> {
-  // No preprocessing — send original file directly to OCR service.
-  // The OCR service already applies grayscale + sharpen internally.
-  // All preprocessing attempts caused regressions.
-  console.log(`[OCR] sending original: ${file.name}, ${Math.round(file.size / 1024)}KB`);
-  return { blob: file, filename: file.name };
+  const normalizedName = file.name.replace(/\.[^.]+$/, "") + "_normalized.jpg";
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sharp = require("sharp");
+    const inputBuffer = Buffer.from(await file.arrayBuffer());
+    const outputBuffer: Buffer = await sharp(inputBuffer)
+      .rotate()                                          // fix EXIF rotation
+      .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
+      .sharpen({ sigma: 1.2 })                           // sharpen first (original working order)
+      .normalize()                                       // then normalize contrast
+      .jpeg({ quality: 92 })
+      .toBuffer();
+    const plainArrayBuffer = outputBuffer.buffer.slice(
+      outputBuffer.byteOffset,
+      outputBuffer.byteOffset + outputBuffer.byteLength
+    );
+    console.log(`[OCR] preprocessed: ${Math.round(outputBuffer.length / 1024)}KB`);
+    return {
+      blob: new Blob([plainArrayBuffer as ArrayBuffer], { type: "image/jpeg" }),
+      filename: normalizedName,
+    };
+  } catch (err) {
+    console.warn("[OCR] sharp preprocessing failed, using original file:", err);
+    return { blob: file, filename: file.name };
+  }
 }
 
 // ─── OCR ─────────────────────────────────────────────────────────────────────
