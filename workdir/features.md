@@ -78,7 +78,15 @@
 
 ## 🔲 בתכנון
 
-### [F-010] Prompt Few-Shot Examples
+---
+
+### [F-011] Gemini Vision — החלפת Tesseract + Ollama
+- **סטטוס:** ✅ מומש, בייצור
+- **תיאור:** Gemini Vision API מחליף את כל pipeline ה-OCR+LLM. תמונה → JSON ישירות, כולל פריטים מפורטים, הנחות, מע"מ, אמצעי תשלום, ברקודים.
+- **קבצים:** `gemini-service.ts` (חדש), `types.ts`, `config.ts`, `parse-service.ts`, שני ה-routes
+- **Session:** 6
+- **עלות:** Free tier Google — ~7,500 חשבוניות/חודש חינם
+
 - **תיאור:** הוספת דוגמאות לפרומפט כדי לשפר דיוק LLM
 - **כדאיות:** 8/10 — השקעה נמוכה, ROI גבוה
 - **Priority:** גבוה

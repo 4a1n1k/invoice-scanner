@@ -245,7 +245,19 @@ ssh -p 2299 root@116.203.149.15 "docker logs invoice-scanner --tail=30"
 - 8/8 unit tests passed על URL extraction
 - Live tests: שילב ✅, Sonol ✅, override ✅, auth ✅
 
-### Session 5 (מרץ 2026) — OCR Quality + Image fixes
+### Session 6 (מרץ 2026) — Gemini Vision replaces Tesseract + Ollama
+- **Gemini Vision API** — מחליף את כל pipeline ה-OCR+LLM בצעד אחד
+- **`gemini-service.ts`** — חדש: `parseImageWithGemini()`, `parseTextWithGemini()`
+- **`types.ts`** — `ParsedInvoice` מורחב: `items[]`, `vat`, `paymentMethod`, `storeAddress`
+- **`InvoiceItem`** — טיפוס חדש: barcode, name, quantity, unitPrice, total, discount, finalPrice
+- **`/api/v1/receipt`** + **`/api/internal/parse`** — מחזירים פריטים מפורטים
+- **מחיקת מודלים מקומיים** — gemma3:4b + llama3.2:3b הוסרו (שוחרר 5.3GB)
+- **`config.ts`** — נוסף `GEMINI_API_KEY`, `GEMINI_MODEL`
+- **API docs** עודכנו — `invoice-scanner-api.md`
+- **features.md** עודכן — F-011
+
+---
+*עודכן לאחרונה: מרץ 2026 — Session 6*
 - **OCR Quality Gate** — `assessOcrQuality()`: score 0-100, checks gibberish/Hebrew ratio/PUA/digits
 - **OCR Quality Badge** ב-UI: `OCR ✓ 85` / `OCR ⚠ 55` / `OCR ✗ 20` + warning banner כשscore < 40
 - **180° Auto-Detection** — `detectUpsideDown()`: brightness comparison top vs bottom strip
