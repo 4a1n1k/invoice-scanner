@@ -73,16 +73,8 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
       .rotate(rotationAngle)                      // fix manual 180° flip if detected
       .resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true })
 
-      // ── Contrast — normalize only, NO linear boost ────────────────────────
-      // The OCR service adds its own grayscale+sharpen pass.
-      // Over-processing here causes double-sharpening artifacts that
-      // destroy thin thermal-print text (receipts).
-      // ── Sharpen BEFORE normalize — original working order ─────────────
-      // sharpen first enhances subtle thermal-print edges,
-      // then normalize stretches the already-enhanced contrast.
-      // Reversing this order degrades Tesseract accuracy on thermal fonts.
-      .sharpen({ sigma: 1.2 })
-      .normalize()
+      // IMPORTANT: The OCR service (/ocr/file) already applies grayscale + sharpen.
+      // We only rotate + resize here to avoid double-processing artifacts.
 
       // ── Output ────────────────────────────────────────────────────────────
       .jpeg({ quality: 92 })
