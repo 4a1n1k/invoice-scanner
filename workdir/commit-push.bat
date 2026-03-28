@@ -1,6 +1,6 @@
 @echo off
 cd /d D:\Projects\Antigravity\invoice-scanner
 git add -A
-git commit -m "fix: remove double-processing - only rotate+resize, let OCR service handle sharpen"
+git commit -m "fix: prompt - largest decimal as fallback amount, date with time format"
 git push origin main
 echo DONE
