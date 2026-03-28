@@ -5,6 +5,7 @@
 
 import { AI_CONFIG } from "./config";
 import type { ParsedInvoice } from "./types";
+import { parseImageWithGemini, parseTextWithGemini } from "./gemini-service";
 
 // ─── Image pre-processing ─────────────────────────────────────────────────────
 
@@ -456,6 +457,7 @@ function repairAndParseJson(raw: string): ParsedInvoice | null {
       date: date ?? new Date().toISOString().split("T")[0],
       type: type ?? "",
       description: description ?? "",
+      items: [],
     };
   }
   return null;
@@ -530,21 +532,16 @@ export interface PipelineResult {
 
 export async function runParsingPipeline(file: File, categories: string[]): Promise<PipelineResult> {
   const t0 = Date.now();
-  const { text: ocrText, ms: ocrMs } = await extractTextViaOcr(file);
 
-  // Quality gate — log warnings, continue anyway but surface score to client
-  const quality = assessOcrQuality(ocrText);
-  if (quality.warnings.length > 0) {
-    console.warn(`[OCR] quality=${quality.score}/100 usable=${quality.usable}`, quality.warnings);
-  } else {
-    console.log(`[OCR] quality=${quality.score}/100 ✓`);
-  }
+  // Route to Gemini Vision — handles rotation, language, layout automatically
+  const { result: parsedInvoice, ms: llmMs } = await parseImageWithGemini(file, categories);
 
-  const prompt = buildParsePrompt(ocrText, categories);
-  const { result: parsedInvoice, payload: llmPayload, ms: llmMs } = await parseInvoiceWithLlm(prompt);
   return {
-    parsedInvoice, ocrText, prompt, llmPayload,
-    timings: { ocr: ocrMs, llm: llmMs, total: Date.now() - t0 },
-    ocrQuality: quality,
+    parsedInvoice,
+    ocrText: "[Gemini Vision — no separate OCR step]",
+    prompt: "[Gemini Vision prompt]",
+    llmPayload: { model: AI_CONFIG.geminiModel } as unknown as LlmPayload,
+    timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
+    ocrQuality: { score: 100, usable: true, warnings: [] },
   };
 }

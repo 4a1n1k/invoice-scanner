@@ -15,14 +15,20 @@ function requireEnv(key: string, fallback?: string): string {
 // ─── External AI Services ────────────────────────────────────────────────────
 
 export const AI_CONFIG = {
-  /** OCR service endpoint — receives multipart/form-data with an "image" field */
-  ocrUrl: requireEnv("OCR_API_URL", "http://116.203.149.15:5050/ocr/file"),
+  /** Gemini API key — replaces local Tesseract + Ollama */
+  geminiApiKey: requireEnv("GEMINI_API_KEY", ""),
 
-  /** Ollama-compatible LLM endpoint */
-  llmUrl: requireEnv("LLM_API_URL", "http://116.203.149.15:11434/api/generate"),
+  /** Gemini model for invoice parsing (vision + text) */
+  geminiModel: requireEnv("GEMINI_MODEL", "gemini-2.5-flash"),
 
-  /** LLM model to use for invoice parsing */
-  llmModel: requireEnv("LLM_MODEL", "gemma3:4b"),
+  /** OCR service endpoint — kept for fallback (legacy) */
+  ocrUrl: requireEnv("OCR_API_URL", "http://host.docker.internal:5050/ocr/file"),
+
+  /** Ollama-compatible LLM endpoint — kept for fallback (legacy) */
+  llmUrl: requireEnv("LLM_API_URL", "http://host.docker.internal:11434/api/generate"),
+
+  /** LLM model — kept for fallback (legacy) */
+  llmModel: requireEnv("LLM_MODEL", "qwen2.5:3b"),
 
   /** Maximum characters of OCR text sent to the LLM (cost / context control) */
   llmMaxChars: parseInt(process.env.LLM_MAX_CHARS ?? "4000", 10),

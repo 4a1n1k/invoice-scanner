@@ -16,7 +16,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { DEFAULT_CATEGORIES, AI_CONFIG } from "@/lib/config";
-import { runParsingPipeline, buildParsePrompt, parseInvoiceWithLlm } from "@/lib/parse-service";
+import { runParsingPipeline } from "@/lib/parse-service";
+import { parseTextWithGemini } from "@/lib/gemini-service";
 import {
   detectProvider,
   fetchReceiptByUrl,
@@ -213,9 +214,8 @@ async function parseFile(file: File, categories: string[]) {
 
     if (isPdfTextUsable(rawText)) {
       const t0 = Date.now();
-      const prompt = buildParsePrompt(rawText, categories);
-      const { result, ms: llmMs } = await parseInvoiceWithLlm(prompt);
-      return { data: { ...result, items: [] }, timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 }, source: "pdf-text" };
+      const { result, ms: llmMs } = await parseTextWithGemini(rawText, categories);
+      return { data: result, timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 }, source: "pdf-gemini" };
     }
 
     const imageBlob = await pdfPageToImageBlob(pdfBuffer);
@@ -274,13 +274,12 @@ async function parseSmsText(text: string, categories: string[]) {
     throw new Error("הדף ריק — ייתכן שהקישור פג תוקף או שהאתר דורש JavaScript");
   }
 
-  const prompt = buildParsePrompt(pageText, categories);
-  const { result, ms: llmMs } = await parseInvoiceWithLlm(prompt);
+  const { result, ms: llmMs } = await parseTextWithGemini(pageText, categories);
   return {
-    data: { ...result, items: [] as ReceiptData["items"] },
+    data: result,
     url,
     timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
-    source: "html-llm",
+    source: "html-gemini",
   };
 }
 

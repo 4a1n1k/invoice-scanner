@@ -48,12 +48,27 @@ export interface CategoryDTO {
 
 // ─── Parse pipeline ───────────────────────────────────────────────────────────
 
-/** The structured result returned by the LLM after parsing an invoice */
+/** A single line item from an invoice */
+export interface InvoiceItem {
+  barcode?: string;       // ברקוד
+  name: string;           // שם הפריט
+  quantity: number;       // כמות
+  unitPrice: number;      // מחיר ליחידה
+  total: number;          // סה"כ לפני הנחה
+  discount?: number;      // הנחה (₪)
+  finalPrice: number;     // מחיר סופי לאחר הנחה
+}
+
+/** The structured result returned by Gemini after parsing an invoice */
 export interface ParsedInvoice {
-  amount: number;
-  date: string; // YYYY-MM-DD
-  type: string; // matches a category name
-  description: string;
+  amount: number;          // סה"כ לתשלום
+  date: string;            // YYYY-MM-DD
+  type: string;            // קטגוריה
+  description: string;     // שם העסק
+  items: InvoiceItem[];    // פריטים מפורטים
+  vat?: number;            // מע"מ
+  paymentMethod?: string;  // אמצעי תשלום
+  storeAddress?: string;   // כתובת העסק
 }
 
 /** Full response from the /api/parse endpoint */

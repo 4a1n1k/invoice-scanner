@@ -55,8 +55,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
-import { AI_CONFIG, DEFAULT_CATEGORIES } from "@/lib/config";
-import { buildParsePrompt, parseInvoiceWithLlm, runParsingPipeline } from "@/lib/parse-service";
+import { DEFAULT_CATEGORIES } from "@/lib/config";
+import { runParsingPipeline } from "@/lib/parse-service";
+import { parseTextWithGemini } from "@/lib/gemini-service";
 import {
   detectProvider,
   fetchReceiptByUrl,
@@ -99,7 +100,17 @@ interface InvoiceResult {
   date: string;
   description: string;
   type: string;
-  items: { name: string; price: number; quantity?: number }[];
+  items: {
+    barcode?: string;
+    name: string;
+    quantity: number;
+    unitPrice: number;
+    total: number;
+    discount?: number;
+    finalPrice: number;
+  }[];
+  vat?: number;
+  paymentMethod?: string;
   storeAddress?: string;
   provider?: string;
 }
@@ -216,12 +227,21 @@ function toInvoice(receipt: ReceiptData, categories: string[]): InvoiceResult {
   else if (/carrefour|קרפור|רמי|שופרסל|מגה|סופר/i.test(name))
     type = categories.find(c => /מזון|אוכל|קניות/i.test(c)) ?? type;
 
+  // Normalize ReceiptItem → InvoiceResult items
+  const items = receipt.items.map(item => ({
+    name: item.name,
+    quantity: item.quantity ?? 1,
+    unitPrice: item.price ?? 0,
+    total: (item.price ?? 0) * (item.quantity ?? 1),
+    finalPrice: (item.price ?? 0) * (item.quantity ?? 1),
+  }));
+
   return {
     amount: receipt.total,
     date: receipt.date,
     description: receipt.storeName,
     type,
-    items: receipt.items,
+    items,
     storeAddress: receipt.storeAddress,
     provider: receipt.provider,
   };
@@ -274,7 +294,7 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
       let timings = { ocr: 0, llm: 0, total: 0 };
 
       if (file.type === "application/pdf") {
-        // PDF path
+        // PDF path — extract text first, then Gemini
         const pdfBuffer = Buffer.from(await file.arrayBuffer());
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const pdfParse = require("pdf-parse/lib/pdf-parse.js");
@@ -282,9 +302,9 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
         const rawText = pdfData.text ?? "";
 
         if (rawText.length > 100) {
+          const { parseTextWithGemini } = await import("@/lib/gemini-service");
           const t1 = Date.now();
-          const prompt = buildParsePrompt(rawText, categories);
-          const { result, ms } = await parseInvoiceWithLlm(prompt);
+          const { result, ms } = await parseTextWithGemini(rawText, categories);
           parsedInvoice = result as unknown as Record<string, unknown>;
           ocrText = rawText;
           timings = { ocr: 0, llm: ms, total: Date.now() - t1 };
@@ -292,23 +312,26 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
           return err(422, "OCR_FAILED", "Could not extract text from PDF. Try uploading as JPG/PNG.");
         }
       } else {
-        // Image path
+        // Image path — Gemini Vision
         const pipeline = await runParsingPipeline(file, categories);
         parsedInvoice = pipeline.parsedInvoice as unknown as Record<string, unknown>;
         ocrText = pipeline.ocrText;
         timings = pipeline.timings;
       }
 
+      const inv = parsedInvoice as unknown as import("@/lib/types").ParsedInvoice;
       return NextResponse.json({
         ok: true,
-        source: "ocr",
+        source: "gemini",
         invoice: {
-          amount: Number(parsedInvoice.amount) || 0,
-          date: String(parsedInvoice.date ?? new Date().toISOString().split("T")[0]),
-          description: String(parsedInvoice.description ?? ""),
-          type: String(parsedInvoice.type ?? categories[0] ?? "אחר"),
-          items: (parsedInvoice.items as InvoiceResult["items"]) ?? [],
-          storeAddress: parsedInvoice.storeAddress as string | undefined,
+          amount: inv.amount || 0,
+          date: inv.date || new Date().toISOString().split("T")[0],
+          description: inv.description || "",
+          type: inv.type || categories[0] || "אחר",
+          items: inv.items || [],
+          vat: inv.vat,
+          paymentMethod: inv.paymentMethod,
+          storeAddress: inv.storeAddress,
         },
         timings: { ...timings, total: Date.now() - t0 },
       } satisfies SuccessResponse);
@@ -387,20 +410,20 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
     );
   }
 
-  // LLM parse
+  // LLM parse via Gemini
   try {
-    const prompt = buildParsePrompt(pageText, categories);
-    const { result: parsedInvoice, ms: llmMs } = await parseInvoiceWithLlm(prompt);
-    const inv = parsedInvoice as unknown as Record<string, unknown>;
+    const { result: parsedInvoice, ms: llmMs } = await parseTextWithGemini(pageText, categories);
     return NextResponse.json({
-      ok: true, source: "url-llm", url, allUrls,
+      ok: true, source: "url-gemini", url, allUrls,
       invoice: {
-        amount: Number(inv.amount) || 0,
-        date: String(inv.date ?? new Date().toISOString().split("T")[0]),
-        description: String(inv.description ?? ""),
-        type: String(inv.type ?? categories[0] ?? "אחר"),
-        items: (inv.items as InvoiceResult["items"]) ?? [],
-        storeAddress: inv.storeAddress as string | undefined,
+        amount: parsedInvoice.amount,
+        date: parsedInvoice.date,
+        description: parsedInvoice.description,
+        type: parsedInvoice.type,
+        items: parsedInvoice.items,
+        vat: parsedInvoice.vat,
+        paymentMethod: parsedInvoice.paymentMethod,
+        storeAddress: parsedInvoice.storeAddress,
       },
       timings: { ocr: 0, llm: llmMs, total: Date.now() - t0 },
     } satisfies SuccessResponse);
