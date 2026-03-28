@@ -105,26 +105,71 @@ async function normalizeImageForOcr(file: File): Promise<{ blob: Blob; filename:
 
 // ─── OCR ─────────────────────────────────────────────────────────────────────
 
-export async function extractTextViaOcr(file: File): Promise<{ text: string; ms: number }> {
-  const { blob, filename } = await normalizeImageForOcr(file);
+// ── Hebrew ratio check ────────────────────────────────────────────────────────
+// Returns the fraction of Hebrew characters in the text (0–1).
+function hebrewRatio(text: string): number {
+  const total = text.replace(/\s/g, "").length;
+  if (total === 0) return 0;
+  const heb = (text.match(/[\u05d0-\u05ea]/g) ?? []).length;
+  return heb / total;
+}
+
+// ── Single OCR call ────────────────────────────────────────────────────────────
+async function ocrCall(blob: Blob, filename: string, signal: AbortSignal): Promise<string> {
   const formData = new FormData();
   formData.append("image", blob, filename);
+  const res = await fetch(AI_CONFIG.ocrUrl, { method: "POST", body: formData, signal });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`OCR service returned ${res.status}: ${detail}`);
+  }
+  const data = await res.json();
+  const text: string = data.text ?? data.result ?? JSON.stringify(data);
+  if (!text?.trim()) throw new Error("OCR service returned empty text");
+  return text;
+}
+
+export async function extractTextViaOcr(file: File): Promise<{ text: string; ms: number }> {
+  const { blob, filename } = await normalizeImageForOcr(file);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_CONFIG.timeoutMs);
   const t0 = Date.now();
   try {
-    const res = await fetch(AI_CONFIG.ocrUrl, {
-      method: "POST",
-      body: formData,
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new Error(`OCR service returned ${res.status}: ${detail}`);
+    const text = await ocrCall(blob, filename, controller.signal);
+    const ratio = hebrewRatio(text);
+    console.log(`[OCR] hebrew ratio: ${(ratio * 100).toFixed(0)}%`);
+
+    // If Hebrew ratio is very low, the image may be upside-down despite preprocessing.
+    // Try again with explicit 180° rotation and pick whichever has more Hebrew.
+    if (ratio < 0.15 && text.length > 30) {
+      console.log("[OCR] low Hebrew ratio — retrying with forced 180° rotation");
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const sharp = require("sharp");
+        const inputBuffer = Buffer.from(await file.arrayBuffer());
+        const rotBuf: Buffer = await sharp(inputBuffer)
+          .rotate()        // EXIF first
+          .rotate(180)     // then force flip
+          .sharpen({ sigma: 1.2 })
+          .normalize()
+          .jpeg({ quality: 92 })
+          .toBuffer();
+        const rotBlob = new Blob(
+          [rotBuf.buffer.slice(rotBuf.byteOffset, rotBuf.byteOffset + rotBuf.byteLength) as ArrayBuffer],
+          { type: "image/jpeg" }
+        );
+        const text180 = await ocrCall(rotBlob, filename, controller.signal);
+        const ratio180 = hebrewRatio(text180);
+        console.log(`[OCR] 180° retry hebrew ratio: ${(ratio180 * 100).toFixed(0)}%`);
+        if (ratio180 > ratio) {
+          console.log("[OCR] 180° version has more Hebrew — using it");
+          return { text: text180, ms: Date.now() - t0 };
+        }
+      } catch (retryErr) {
+        console.warn("[OCR] 180° retry failed:", retryErr);
+      }
     }
-    const data = await res.json();
-    const text: string = data.text ?? data.result ?? JSON.stringify(data);
-    if (!text?.trim()) throw new Error("OCR service returned empty text");
+
     return { text, ms: Date.now() - t0 };
   } finally {
     clearTimeout(timer);
