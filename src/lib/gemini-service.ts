@@ -81,7 +81,7 @@ async function callGeminiApi(parts: GeminiPart[]): Promise<string> {
     contents: [{ parts }],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 4096,
+      maxOutputTokens: 8192,
       responseMimeType: "application/json",
     },
   };
@@ -112,6 +112,33 @@ async function callGeminiApi(parts: GeminiPart[]): Promise<string> {
 
 // ─── JSON parser ──────────────────────────────────────────────────────────────
 
+function repairTruncatedJson(raw: string): string {
+  // Close unclosed strings, arrays, objects to recover partial JSON
+  let s = raw.trim();
+
+  // Count unclosed braces/brackets
+  let braces = 0, brackets = 0;
+  let inString = false, escaped = false;
+  for (const ch of s) {
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && inString) { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') braces++;
+    if (ch === '}') braces--;
+    if (ch === '[') brackets++;
+    if (ch === ']') brackets--;
+  }
+
+  // If we're mid-string, close it
+  if (inString) s += '"';
+  // Close any open arrays/objects
+  s += ']'.repeat(Math.max(0, brackets));
+  s += '}'.repeat(Math.max(0, braces));
+
+  return s;
+}
+
 function parseGeminiJson(raw: string, categories: string[], today: string): ParsedInvoice {
   // Strip markdown fences if present
   const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
@@ -120,7 +147,15 @@ function parseGeminiJson(raw: string, categories: string[], today: string): Pars
   try {
     obj = JSON.parse(cleaned);
   } catch {
-    throw new Error(`Gemini returned invalid JSON: ${cleaned.slice(0, 200)}`);
+    // Try to repair truncated JSON (e.g. response cut mid-items array)
+    console.warn("[Gemini] JSON parse failed, attempting repair...");
+    try {
+      const repaired = repairTruncatedJson(cleaned);
+      obj = JSON.parse(repaired);
+      console.log("[Gemini] JSON repaired successfully");
+    } catch {
+      throw new Error(`Gemini returned invalid JSON: ${cleaned.slice(0, 300)}`);
+    }
   }
 
   // Normalize items
