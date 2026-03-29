@@ -266,10 +266,11 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
   if (!userId) return err(401, "UNAUTHORIZED", "Authentication required. Pass Bearer token or login cookie.");
 
   // ── Fetch user categories ─────────────────────────────────────────────────
+  // Priority: categories passed in body > categories from DB > DEFAULT_CATEGORIES
   const userCategories = await prisma.category.findMany({
     where: { userId }, select: { name: true }, orderBy: { name: "asc" },
   });
-  const categories = userCategories.length > 0
+  const dbCategories = userCategories.length > 0
     ? userCategories.map(c => c.name)
     : [...DEFAULT_CATEGORIES];
 
@@ -287,6 +288,12 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
     const file = formData.get("file") as File | null;
     if (!file || file.size === 0)
       return err(400, "BAD_INPUT", "No file provided. Send a PDF or image as 'file' field.");
+
+    // Accept caller-supplied categories (e.g. from home-manager expense_categories)
+    const bodyCatsRaw = formData.get("categories");
+    const categories: string[] = bodyCatsRaw
+      ? JSON.parse(String(bodyCatsRaw))
+      : dbCategories;
 
     try {
       let parsedInvoice: Record<string, unknown>;
@@ -344,9 +351,14 @@ export async function POST(req: NextRequest): Promise<NextResponse<SuccessRespon
   // ══════════════════════════════════════════════════════════════════════════
   // MODE B — application/json → URL / SMS text
   // ══════════════════════════════════════════════════════════════════════════
-  let body: { text?: string; overrideUrl?: string };
+  let body: { text?: string; overrideUrl?: string; categories?: string[] };
   try { body = await req.json(); }
   catch { return err(400, "BAD_INPUT", "Invalid JSON body."); }
+
+  // Accept caller-supplied categories
+  const categories: string[] = (Array.isArray(body?.categories) && body.categories.length > 0)
+    ? body.categories
+    : dbCategories;
 
   const rawText = (body?.text ?? "").trim();
   if (!rawText) return err(400, "BAD_INPUT", "Body must contain a 'text' field with URL or SMS message.");
